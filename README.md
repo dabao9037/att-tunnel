@@ -105,6 +105,12 @@ A 端菜单 `3` 看分享链接，任意支持 VLESS + REALITY + XHTTP 的客户
 
 5. **B 换 IP 后 A 侧会留一条僵死隧道**，portal 仍往里派流量，导致约 1/4 请求挂死。`tcpUserTimeout` 对 accept 出来的连接不生效；真正有效的是内核 `tcp_retries2`（默认 15 ≈ 15 分钟）。脚本设为 5（≈20 秒）。实测：调之前 6/8，调之后 10/10。
 
+7. **新版 Xray（26.4+）已移除旧 `reverse` 语法**。旧写法（顶层 `reverse.portals/bridges` + 虚拟域名路由）会直接报 `The feature "legacy reverse" has been removed`。新写法是在 VLESS user 上写 `"reverse": {"tag": "portal"}`，B 侧 outbound 必须用 simplified style（`address`/`port`/`id` 平铺，不能用 `vnext`）。脚本会自动探测用哪一代并生成对应配置。
+
+8. **新版 freedom 对 `vless-reverse` 入站默认 block 全部流量**（源码 `getDefaultFinalRule` 里的反滥用设计）。表现是隧道 ESTAB 正常、路由也对，但流量全被 `blocked target ... blackholing` 。必须在 B 的 freedom 上显式写 `finalRules`（先 block `geoip:private` 再 `allow`）。
+
+9. **不能用官方安装脚本升级别人的 Xray**。它会 stop/接管 `xray.service`（在只有面板自建服务的机器上直接报 `Unit xray.service not loaded` 并失败），而且它装的版本可能比你现有的**更旧**（实例：NodeLite 自带 26.6.27，官方脚本却装 26.3.27，属于降级）。现在改为直接拉 latest 二进制，并且**绝不覆盖非 `/usr/local/bin/xray` 的二进制**；若现有的太旧，另装一份到 `/usr/local/bin/xray` 专用。
+
 6. **已装 Xray 的机器上原本会误报「安装 Xray 失败」**。原因有两层：安装输出被丢进 `/dev/null` 所以真实错误不可见；以及已有 xray 占着 443 时报错没说清怎么办。现在改为复用已有 xray + 打印官方脚本真实错误 + 列出 443 占用进程并给出解决办法。
 
 ## 已验证
@@ -123,6 +129,8 @@ A 端菜单 `3` 看分享链接，任意支持 VLESS + REALITY + XHTTP 的客户
 - 默认 443 路径回归测试 10/10（无退化）
 - SNI 换为 NodeLite 的 `www.atlasobscura.com` 后端到端 12/12；`ATT_SNI` 手动指定与无效域名自动回退均正常
 - **与现有 xray 节点共存验证**：在一台已跑着 REALITY 节点（占着 443）的机器上安装 —— 安装前后对方配置 SHA256 / 服务状态 / MainPID 完全一致，原节点流量 6/6；新节点自动落到 8443 并 12/12；两节点同时可用各 5/5；卸载 att-tunnel 后原节点仍 6/6
+- **新语法（VLESS Reverse Proxy）端到端 12/12**，包含 freedom finalRules 放行修正
+- **NodeLite 场景验证**：机器上只有 `/opt/nodelite/bin/xray`（旧版）时，脚本另装一份新版到 `/usr/local/bin/xray` 专用，NodeLite 二进制 SHA256 前后完全一致，新节点 12/12
 
 **未验证**：真实 AT&T 线路上的丢包改善幅度（需要实际 AT&T 出口机）；不同云厂商安全组需自行放行 443 与反代端口。
 

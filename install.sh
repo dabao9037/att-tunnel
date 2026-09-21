@@ -3,7 +3,7 @@
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -11,6 +11,7 @@ CFG="$CFG_DIR/config.json"
 SVC="att-tunnel"
 STATE="/etc/att-tunnel"
 TUNNEL_DOMAIN="tunnel.internal"
+REVERSE_STYLE="new"   # 由 install_xray 实测覆盖：new=VLESS Reverse Proxy / old=顶层 reverse
 
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYN=$'\033[36m'; BLD=$'\033[1m'; RST=$'\033[0m'
 info(){ echo "${CYN}==>${RST} $*"; }
@@ -36,7 +37,9 @@ install_deps(){
 install_xray(){
   # 已有 xray 就用，不重装（可能是 3x-ui / 宝塔 / 手动装的）
   local found=""
-  if [ -x "$XRAY_BIN" ]; then
+  if [ "${ATT_FORCE_INSTALL:-0}" = 1 ]; then
+    found=""
+  elif [ -n "${XRAY_BIN:-}" ] && [ -x "${XRAY_BIN:-}" ]; then
     found="$XRAY_BIN"
   elif command -v xray >/dev/null 2>&1; then
     found=$(command -v xray)
@@ -57,8 +60,28 @@ install_xray(){
     else
       ok "复用已有 Xray: $ver"
       echo "    路径: $XRAY_BIN"
-      # Reverse + XHTTP 需要较新版本，先用真实配置探一下
+      # 探测该版本用哪一代 reverse 语法：
+      #   new = VLESS Reverse Proxy（user 内 "reverse":{"tag"}），26.4+ 已强制
+      #   old = 顶层 "reverse":{portals/bridges}，旧版
       local probe; probe=$(mktemp --suffix=.json)
+      cat > "$probe" <<'PROBE'
+{ "log": { "loglevel": "warning" },
+  "inbounds": [],
+  "outbounds": [
+    { "tag": "t", "protocol": "vless",
+      "settings": { "address": "127.0.0.1", "port": 12345,
+        "id": "11111111-1111-1111-1111-111111111111", "encryption": "none",
+        "reverse": { "tag": "bridge" } },
+      "streamSettings": { "network": "raw" } },
+    { "tag": "f", "protocol": "freedom" } ],
+  "routing": { "rules": [ { "type": "field", "inboundTag": [ "bridge" ], "outboundTag": "f" } ] } }
+PROBE
+      if "$XRAY_BIN" -test -config "$probe" >/dev/null 2>&1; then
+        REVERSE_STYLE=new
+        ok "版本支持新版 VLESS Reverse + XHTTP"
+        rm -f "$probe"
+        return 0
+      fi
       cat > "$probe" <<'PROBE'
 { "log": { "loglevel": "warning" },
   "reverse": { "portals": [ { "tag": "p", "domain": "t.internal" } ] },
@@ -69,34 +92,78 @@ install_xray(){
   "routing": { "rules": [ { "type": "field", "inboundTag": [ "i" ], "outboundTag": "p" } ] } }
 PROBE
       if "$XRAY_BIN" -test -config "$probe" >/dev/null 2>&1; then
-        ok "版本支持 Reverse + XHTTP"
+        REVERSE_STYLE=old
+        ok "版本支持旧版 reverse + XHTTP"
         rm -f "$probe"
         return 0
       fi
       rm -f "$probe"
-      warn "当前 Xray 不支持 Reverse 或 XHTTP，需升级"
-      read -rp "升级到最新版？（会覆盖 $XRAY_BIN，现有配置不动）[y/N]: " yn
-      [ "$yn" = y ] || [ "$yn" = Y ] || die "已取消。请先自行升级 Xray-core 到支持 XHTTP+Reverse 的版本"
+      warn "当前 Xray 两种 reverse 语法都不支持（版本过旧？）"
+
+      # 关键：绝不覆盖别人的 xray（NodeLite / 3x-ui / 宝塔等）
+      if [ "$XRAY_BIN" != "/usr/local/bin/xray" ]; then
+        echo
+        echo "检测到的 Xray 在 ${BLD}$XRAY_BIN${RST}，它很可能属于其他面板（如 NodeLite / 3x-ui）。"
+        echo "我${BLD}不会${RST}去覆盖它，以免弄坏你现有面板。"
+        echo "将单独安装一份到 /usr/local/bin/xray 给本工具自己用。"
+        echo
+      fi
     fi
   fi
 
-  info "安装 Xray-core ..."
-  local log; log=$(mktemp)
-  if ! bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install > "$log" 2>&1; then
-    echo "${RED}--- 官方安装脚本输出（末尾 15 行）---${RST}"
-    tail -15 "$log"
-    echo "${RED}------------------------------------${RST}"
-    echo "常见原因："
-    echo "  • GitHub 不可达 —— 试：curl -I https://github.com"
-    echo "  • 缺 unzip —— 试：apt install unzip 或 yum install unzip"
-    echo "  • 硬盘满 —— 试：df -h"
-    rm -f "$log"
-    die "Xray 安装失败（上方是真实错误）"
+  info "安装专用 Xray-core 到 /usr/local/bin/xray ..."
+  # 不用官方安装脚本：它会 stop/接管 xray.service，在已有面板的机器上会出问题，
+  # 而且可能装比现有版本更旧的版。直接拉 latest 二进制。
+  local arch tmpd
+  case "$(uname -m)" in
+    x86_64|amd64)  arch=64 ;;
+    aarch64|arm64) arch=arm64-v8a ;;
+    armv7l)        arch=arm32-v7a ;;
+    *) die "不支持的架构：$(uname -m)" ;;
+  esac
+  tmpd=$(mktemp -d)
+  local url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$arch.zip"
+  if ! curl -fsSL --max-time 180 -o "$tmpd/x.zip" "$url"; then
+    rm -rf "$tmpd"
+    echo "下载失败：$url"
+    echo "常见原因：GitHub 不可达（curl -I https://github.com）/ 硬盘满（df -h）"
+    die "Xray 下载失败"
   fi
-  rm -f "$log"
+  if ! unzip -oq "$tmpd/x.zip" -d "$tmpd"; then
+    rm -rf "$tmpd"; die "解包失败（缺 unzip？）"
+  fi
+  [ -f "$tmpd/xray" ] || { rm -rf "$tmpd"; die "包里没找到 xray 二进制"; }
+  install -m 755 "$tmpd/xray" /usr/local/bin/xray
+  mkdir -p /usr/local/share/xray
+  for f in geoip.dat geosite.dat; do
+    [ -f "$tmpd/$f" ] && install -m 644 "$tmpd/$f" "/usr/local/share/xray/$f"
+  done
+  rm -rf "$tmpd"
   XRAY_BIN="/usr/local/bin/xray"
   [ -x "$XRAY_BIN" ] || die "安装后未找到 $XRAY_BIN"
-  ok "Xray 安装完成: $("$XRAY_BIN" version | head -1)"
+  ok "Xray 已安装: $("$XRAY_BIN" version | head -1)"
+
+  # 新装的肯定是新语法，但还是实测一下
+  local probe; probe=$(mktemp --suffix=.json)
+  cat > "$probe" <<'PROBE'
+{ "log": { "loglevel": "warning" },
+  "inbounds": [],
+  "outbounds": [
+    { "tag": "t", "protocol": "vless",
+      "settings": { "address": "127.0.0.1", "port": 12345,
+        "id": "11111111-1111-1111-1111-111111111111", "encryption": "none",
+        "reverse": { "tag": "bridge" } },
+      "streamSettings": { "network": "raw" } },
+    { "tag": "f", "protocol": "freedom" } ],
+  "routing": { "rules": [ { "type": "field", "inboundTag": [ "bridge" ], "outboundTag": "f" } ] } }
+PROBE
+  if "$XRAY_BIN" -test -config "$probe" >/dev/null 2>&1; then
+    REVERSE_STYLE=new
+  else
+    REVERSE_STYLE=old
+  fi
+  rm -f "$probe"
+  ok "reverse 语法：$REVERSE_STYLE"
 }
 
 # ---------- 回落域名：实测可用才用（文档坑：microsoft 在新版会握手失败） ----------
@@ -219,6 +286,13 @@ open_fw(){
 deploy_a(){
   need_root; install_deps; install_xray
 
+  # A 端优先用新语法：若复用到的是老版 xray，另装一份新版给本工具专用
+  if [ "$REVERSE_STYLE" = old ]; then
+    warn "复用到的 Xray 是旧 reverse 语法；为兼容性另装一份新版给本工具专用"
+    XRAY_BIN=""
+    ATT_FORCE_INSTALL=1 install_xray
+  fi
+
   local uport="${ATT_PORT:-443}"
   case "$uport" in (*[!0-9]*) die "ATT_PORT 必须是数字";; esac
 
@@ -272,11 +346,25 @@ deploy_a(){
   enc=$(echo "$ve" | grep -o '"encryption": "[^"]*"' | head -1 | cut -d'"' -f4)
   [ -n "$dec" ] && [ -n "$enc" ] || die "VLESS Encryption 生成失败（Xray 版本过旧？）"
 
+  # 新/旧 reverse 语法差异：
+  #   new: portal 声明在 reverse-in 的 user 上，无顶层 reverse / 无 tunnel.internal 路由
+  #   old: 顶层 reverse.portals + 虚拟域名路由
+  local a_reverse_blk a_bclient a_extra_rule
+  if [ "$REVERSE_STYLE" = new ]; then
+    a_reverse_blk=""
+    a_bclient="{ \"id\": \"$buuid\", \"reverse\": { \"tag\": \"portal\" } }"
+    a_extra_rule=""
+  else
+    a_reverse_blk="  \"reverse\": { \"portals\": [ { \"tag\": \"portal\", \"domain\": \"$TUNNEL_DOMAIN\" } ] },"
+    a_bclient="{ \"id\": \"$buuid\" }"
+    a_extra_rule="      { \"type\": \"field\", \"inboundTag\": [ \"reverse-in\" ], \"domain\": [ \"full:$TUNNEL_DOMAIN\" ], \"outboundTag\": \"portal\" },"
+  fi
+
   local tmp; tmp=$(mktemp --suffix=.json)
   cat > "$tmp" <<EOF
 {
   "log": { "loglevel": "warning" },
-  "reverse": { "portals": [ { "tag": "portal", "domain": "$TUNNEL_DOMAIN" } ] },
+$a_reverse_blk
   "inbounds": [
     {
       "tag": "user-in",
@@ -305,7 +393,7 @@ deploy_a(){
       "port": $rport,
       "protocol": "vless",
       "settings": {
-        "clients": [ { "id": "$buuid" } ],
+        "clients": [ $a_bclient ],
         "decryption": "$dec"
       },
       "streamSettings": {
@@ -317,7 +405,7 @@ deploy_a(){
   "outbounds": [ { "tag": "direct", "protocol": "freedom" } ],
   "routing": {
     "rules": [
-      { "type": "field", "inboundTag": [ "reverse-in" ], "domain": [ "full:$TUNNEL_DOMAIN" ], "outboundTag": "portal" },
+$a_extra_rule
       { "type": "field", "user": [ "node1" ], "outboundTag": "portal" }
     ]
   }
@@ -342,11 +430,12 @@ XPATH=$path
 REALITY_PUB=$pub
 BRIDGE_UUID=$buuid
 VLESS_ENC=$enc
+REVERSE_STYLE=$REVERSE_STYLE
 EOF
   chmod 600 "$STATE/a.env"
 
   local token
-  token=$(printf '%s|%s|%s|%s' "$aip" "$rport" "$buuid" "$enc" | base64 -w0)
+  token=$(printf '%s|%s|%s|%s|%s' "$aip" "$rport" "$buuid" "$enc" "$REVERSE_STYLE" | base64 -w0)
 
   echo
   echo "${BLD}=========== 服务器 A 部署完成 ===========${RST}"
@@ -366,13 +455,28 @@ deploy_b(){
   local token="${1:-}"
   [ -n "$token" ] || die "缺少 token，请用 A 端输出的完整命令"
 
-  local dec aip rport buuid enc
+  local dec aip rport buuid enc tstyle
   dec=$(echo "$token" | base64 -d 2>/dev/null) || die "token 解析失败"
-  IFS='|' read -r aip rport buuid enc <<<"$dec"
+  IFS='|' read -r aip rport buuid enc tstyle <<<"$dec"
   [ -n "$aip" ] && [ -n "$rport" ] && [ -n "$buuid" ] && [ -n "$enc" ] || die "token 内容不完整"
 
   install_deps; install_xray
-  info "将主动拨向 A: $aip:$rport"
+
+  # B 必须跟 A 用同一代语法；老 token 没带 style 时用本机探测结果
+  if [ -n "${tstyle:-}" ] && [ "$tstyle" != "$REVERSE_STYLE" ]; then
+    warn "A 用 $tstyle 语法，本机找到的 Xray 是 $REVERSE_STYLE"
+    if [ "$tstyle" = new ]; then
+      info "另装一份新版 Xray 到 /usr/local/bin/xray 给本工具用（不动 $XRAY_BIN）"
+      XRAY_BIN=""          # 强制走安装分支
+      ATT_FORCE_INSTALL=1 install_xray
+      [ "$REVERSE_STYLE" = new ] || die "新装的 Xray 仍不支持新语法，请反馈"
+    else
+      warn "按 A 的旧语法生成配置"
+      REVERSE_STYLE="$tstyle"
+    fi
+  fi
+
+  info "将主动拨向 A: $aip:$rport（reverse 语法 $REVERSE_STYLE）"
 
   if ! timeout 8 bash -c "</dev/tcp/$aip/$rport" 2>/dev/null; then
     warn "暂时连不上 $aip:$rport —— 检查 A 的防火墙/安全组是否放行了该端口"
@@ -381,8 +485,52 @@ deploy_b(){
     ok "A 的反代端口可达"
   fi
 
+  # 新语法：bridge 声明在 outbound 的 reverse 字段（必须用 simplified style，不能用 vnext）
+  # 关键：新版 freedom 对 vless-reverse 入站默认 block 全部（防滥用），
+  # 必须显式 finalRules 放行，否则隧道通但流量全被 blackhole
   local tmp; tmp=$(mktemp --suffix=.json)
-  cat > "$tmp" <<EOF
+  if [ "$REVERSE_STYLE" = new ]; then
+    cat > "$tmp" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "tag": "tunnel",
+      "protocol": "vless",
+      "settings": {
+        "address": "$aip",
+        "port": $rport,
+        "id": "$buuid",
+        "encryption": "$enc",
+        "reverse": { "tag": "bridge" }
+      },
+      "streamSettings": {
+        "network": "raw",
+        "sockopt": { "tcpKeepAliveInterval": 10, "tcpKeepAliveIdle": 30, "tcpUserTimeout": 20000 }
+      }
+    },
+    {
+      "tag": "freedom",
+      "protocol": "freedom",
+      "settings": {
+        "finalRules": [
+          { "action": "block", "ip": [ "geoip:private" ] },
+          { "action": "allow" }
+        ]
+      },
+      "streamSettings": { "sockopt": { "domainStrategy": "UseIPv4" } }
+    }
+  ],
+  "routing": {
+    "rules": [
+      { "type": "field", "inboundTag": [ "bridge" ], "outboundTag": "freedom" }
+    ]
+  }
+}
+EOF
+  else
+    cat > "$tmp" <<EOF
 {
   "log": { "loglevel": "warning" },
   "reverse": { "bridges": [ { "tag": "bridge", "domain": "$TUNNEL_DOMAIN" } ] },
@@ -413,6 +561,7 @@ deploy_b(){
   }
 }
 EOF
+  fi
 
   apply_cfg "$tmp"
   harden_service
