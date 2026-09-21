@@ -39,14 +39,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-tunnel/main/in
 
 要求：443 未被占用、公网 IP 固定（不绑域名的代价就是 A 的 IP 不能变）。
 
-**443 已被占用？**（机器上已有 xray / nginx / 3x-ui）脚本会列出占用进程并停下，不动你现有服务。两个办法：
+**443 被占用也能直接跑。** 脚本会自动改用 8443（依次尝试 8443/2053/2083/2087/2096/8080）继续部署，**不会动你占用 443 的服务**。想自己指定：
 
 ```bash
-# 办法一：换个入口端口
 ATT_PORT=8443 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-tunnel/main/install.sh) --server-a
-
-# 办法二：先停掉占 443 的服务再重跑
 ```
+
+注意：非 443 的 REALITY 伪装效果会打折（Xray 自己也会告警）。能腾出 443 就腾。
+
+**与现有节点完全隔离。** 本工具用独立配置 `/usr/local/etc/att-tunnel/config.json` 和独立服务 `att-tunnel.service`，**不覆盖 `/usr/local/etc/xray/config.json`，也不重启你的 `xray.service`**。机器上已有 3x-ui / NodeLite / 手动节点都能并存。卸载也只动自己的东西。
 
 **已装过 Xray？** 脚本会直接复用（不重装），并自动探测版本是否支持 Reverse + XHTTP；不支持才询问你是否升级。除 `/usr/local/bin/xray` 外，也会自动在 `/usr/bin`、3x-ui、宝塔等常见路径查找。
 

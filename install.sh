@@ -3,10 +3,12 @@
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 XRAY_BIN="/usr/local/bin/xray"
-CFG_DIR="/usr/local/etc/xray"
+# 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
+CFG_DIR="/usr/local/etc/att-tunnel"
 CFG="$CFG_DIR/config.json"
+SVC="att-tunnel"
 STATE="/etc/att-tunnel"
 TUNNEL_DOMAIN="tunnel.internal"
 
@@ -134,6 +136,29 @@ free_port(){
 
 pubip(){ curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || curl -fsS --max-time 10 https://ifconfig.me 2>/dev/null; }
 
+# 建立独立 systemd 服务（不动官方 xray.service）
+write_unit(){
+  cat > "/etc/systemd/system/$SVC.service" <<EOF
+[Unit]
+Description=att-tunnel (Xray VLESS Reverse)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$XRAY_BIN run -config $CFG
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
 # 原子写入 + 配置校验，失败自动还原
 apply_cfg(){
   local new="$1"
@@ -148,21 +173,21 @@ apply_cfg(){
   mv "$new" "$CFG"
   chmod 644 "$CFG"
   chown root:root "$CFG"
-  systemctl enable xray >/dev/null 2>&1 || true
-  systemctl restart xray
+  write_unit
+  systemctl enable "$SVC" >/dev/null 2>&1 || true
+  systemctl restart "$SVC"
   sleep 2
-  systemctl is-active --quiet xray || {
+  systemctl is-active --quiet "$SVC" || {
     local bak; bak=$(ls -t "$CFG".bak-* 2>/dev/null | head -1)
-    [ -n "$bak" ] && { cp "$bak" "$CFG"; systemctl restart xray; }
-    die "Xray 启动失败，已回滚。journalctl -u xray -n 30 查看原因"
+    [ -n "$bak" ] && { cp "$bak" "$CFG"; systemctl restart "$SVC"; }
+    echo "--- 服务日志 ---"; journalctl -u "$SVC" -n 15 --no-pager 2>&1 | tail -10
+    die "启动失败，已回滚"
   }
-  ok "配置已生效，Xray 运行中"
+  ok "配置已生效，$SVC 运行中（独立服务，未动你现有 xray）"
 }
 
 harden_service(){
-  mkdir -p /etc/systemd/system/xray.service.d
-  printf '[Service]\nRestart=always\nRestartSec=5\n' > /etc/systemd/system/xray.service.d/restart.conf
-  systemctl daemon-reload
+  : # 自我12服务 unit 里已包含 Restart=always / RestartSec=5
 }
 
 # A 侧必需：B 换 IP 后会留下一条僵死隧道，portal 仍会往里派流量，
@@ -203,16 +228,30 @@ deploy_a(){
 
   if ss -ltn 2>/dev/null | grep -q ":$uport "; then
     echo
-    echo "${RED}$uport 已被占用。${RST}当前占用进程："
+    warn "$uport 已被占用："
     ss -ltnp 2>/dev/null | grep ":$uport " | sed 's/^/    /'
+
+    if [ -n "${ATT_PORT:-}" ]; then
+      # 用户显式指定了端口，不自作主张换
+      echo
+      echo "你显式指定了 ATT_PORT=$uport，但它被占用了。"
+      echo "换个端口重跑，或去掉 ATT_PORT 让脚本自动选。"
+      die "已停止，没有动你现有服务"
+    fi
+
+    # 自动改用备选端口，按「像 HTTPS」的程度排序
+    local cand p
+    for p in 8443 2053 2083 2087 2096 8080; do
+      ss -ltn 2>/dev/null | grep -q ":$p " || { cand=$p; break; }
+    done
+    [ -n "${cand:-}" ] || cand=$(free_port)
+
+    uport="$cand"
     echo
-    echo "你有三个选择："
-    echo "  1) 先停掉占用 443 的服务（如已有 xray / nginx / 3x-ui）再重跑"
-    echo "  2) 换个入口端口：${CYN}ATT_PORT=8443 bash install.sh --server-a${RST}"
-    echo "     （非 443 可能更容易被识别，但能用）"
-    echo "  3) 换一台干净的机器做 A 端"
+    ok "自动改用端口 $uport，继续部署（没有动你占用 443 的服务）"
+    warn "非 443 的 REALITY 伪装效果会打折；如能腾出 443，停掉占用服务后重跑更好"
+    warn "云厂商安全组记得放行 $uport/tcp"
     echo
-    die "已停止，没有动你现有服务"
   fi
 
   info "挑选可用 REALITY 回落域名 ..."
@@ -420,9 +459,9 @@ show_links(){
     echo
     echo "${CYN}[$n]${RST}"
     echo "vless://$uuid@$A_IP:$uport?encryption=none&security=reality&type=xhttp&path=$epath&mode=auto&sni=$SNI&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID#$n"
-  done < <("$XRAY_BIN" -test -config "$CFG" >/dev/null 2>&1 && python3 - <<'PY'
-import json,sys
-d=json.load(open('/usr/local/etc/xray/config.json'))
+  done < <("$XRAY_BIN" -test -config "$CFG" >/dev/null 2>&1 && ATT_CFG="$CFG" python3 - <<'PY'
+import json,os
+d=json.load(open(os.environ['ATT_CFG']))
 for ib in d['inbounds']:
     if ib.get('tag')=='user-in':
         for c in ib['settings']['clients']:
@@ -440,9 +479,9 @@ add_node(){
   [ -n "$name" ] || die "名称不能为空"
   local uuid; uuid=$("$XRAY_BIN" uuid)
   local tmp; tmp=$(mktemp --suffix=.json)
-  NEW_NAME="$name" NEW_UUID="$uuid" python3 - > "$tmp" <<'PY'
+  NEW_NAME="$name" NEW_UUID="$uuid" ATT_CFG="$CFG" python3 - > "$tmp" <<'PY'
 import json,os
-d=json.load(open('/usr/local/etc/xray/config.json'))
+d=json.load(open(os.environ['ATT_CFG']))
 name=os.environ['NEW_NAME']; uuid=os.environ['NEW_UUID']
 for ib in d['inbounds']:
     if ib.get('tag')=='user-in':
@@ -464,7 +503,7 @@ PY
 # ================= 自检 =================
 selfcheck(){
   echo "${BLD}--- 运行自检 ---${RST}"
-  if systemctl is-active --quiet xray; then ok "Xray active"; else echo "${RED}[X]${RST} Xray 未运行"; fi
+  if systemctl is-active --quiet "$SVC"; then ok "$SVC active"; else echo "${RED}[X]${RST} $SVC 未运行"; fi
 
   if [ -f "$STATE/a.env" ]; then
     source "$STATE/a.env"
@@ -538,19 +577,20 @@ ssh_migrate(){
 # ================= 卸载 =================
 uninstall(){
   need_root
-  read -rp "确认卸载？会删除 Xray 配置与本工具状态（输 yes）: " c
+  read -rp "确认卸载 att-tunnel？（不影响你其他 xray 节点，输 yes）: " c
   [ "$c" = yes ] || { warn "已取消"; return; }
-  systemctl stop xray 2>/dev/null || true
-  systemctl disable xray 2>/dev/null || true
-  rm -f /etc/systemd/system/xray.service.d/restart.conf
+  systemctl stop "$SVC" 2>/dev/null || true
+  systemctl disable "$SVC" 2>/dev/null || true
+  rm -f "/etc/systemd/system/$SVC.service"
   systemctl daemon-reload 2>/dev/null || true
   local bdir="/root/att-tunnel-backup-$(date +%Y%m%d%H%M%S)"
   mkdir -p "$bdir"
   [ -f "$CFG" ] && cp "$CFG" "$bdir/" 2>/dev/null || true
   [ -d "$STATE" ] && cp -r "$STATE" "$bdir/" 2>/dev/null || true
-  rm -rf "$STATE"
-  ok "已停止并清理。备份在：$bdir"
-  warn "Xray 本体未删除。彻底移除：bash -c \"\$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\" @ remove"
+  rm -rf "$STATE" "$CFG_DIR"
+  ok "已停止并清理 att-tunnel。备份在：$bdir"
+  ok "你机器上原有的 xray / 3x-ui / NodeLite 未受影响"
+  warn "Xray 二进制未删除（可能其他服务在用）"
   warn "SSH 端口改动不会自动还原，需手动处理 /etc/ssh/sshd_config.d/00-att-tunnel-port.conf"
 }
 
