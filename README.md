@@ -47,22 +47,15 @@ ATT_PORT=8443 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-
 
 注意：非 443 的 REALITY 伪装效果会打折（Xray 自己也会告警）。能腾出 443 就腾。
 
-## 两条链接，任选一条
+## 只生成一条链接（Vision）
 
-raw 模式下每个节点会生成**两条**分享链接（不同 UUID）：
+每个节点只生成一条分享链接，**必带 `flow=xtls-rprx-vision`**，一切以抗封为准。
 
-| 链接 | flow | 说明 |
-|---|---|---|
-| `node1` | `xtls-rprx-vision` | 抗封更好，**优先用这个** |
-| `node1-compat` | 无 | 客户端不支持 Vision 时的保底 |
-
-原因：`flow` 必须**两端完全一致**。服务端有 Vision 而客户端没填 `flow` 时，Xray 直接拒绕：
+客户端导入后请核对 `flow` 字段在不在。`flow` 必须**两端完全一致**，客户端丢了这个参数就会报 `EOF` / `502`，服务端日志会写：
 
 ```
 account ... is rejected since the client flow is empty
 ```
-
-客户端看到的就是 `EOF` 或 `502`。不少客户端导入分享链接时会丢掉 `flow` 参数，所以干脉两条都给。
 
 ## 抗封说明
 

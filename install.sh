@@ -3,7 +3,7 @@
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
 set -euo pipefail
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -173,7 +173,13 @@ free_port(){
   done
 }
 
-pubip(){ curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || curl -fsS --max-time 10 https://ifconfig.me 2>/dev/null; }
+pubip(){
+  # 允许手动指定，避免探测失败卡住
+  if [ -n "${ATT_IP:-}" ]; then printf '%s' "$ATT_IP"; return 0; fi
+  curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null \
+    || curl -fsS --max-time 10 https://ifconfig.me 2>/dev/null \
+    || curl -fsS --max-time 10 https://icanhazip.com 2>/dev/null
+}
 
 # 建立独立 systemd 服务（不动官方 xray.service）
 write_unit(){
@@ -243,15 +249,35 @@ EOF
 }
 
 open_fw(){
-  local p="$1"
+  local p="$1" done_any=0
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    ufw allow "$p/tcp" >/dev/null 2>&1 && ok "ufw 已放行 $p/tcp"
-  elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="$p/tcp" >/dev/null 2>&1
-    firewall-cmd --reload >/dev/null 2>&1 && ok "firewalld 已放行 $p/tcp"
-  else
-    warn "未检测到活动防火墙，跳过（云厂商安全组仍需手动放行 $p/tcp）"
+    ufw allow "$p/tcp" >/dev/null 2>&1 && { ok "ufw 已放行 $p/tcp"; done_any=1; }
   fi
+  if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="$p/tcp" >/dev/null 2>&1
+    firewall-cmd --reload >/dev/null 2>&1 && { ok "firewalld 已放行 $p/tcp"; done_any=1; }
+  fi
+  # 很多 VPS 没有 ufw/firewalld，但 iptables INPUT 默认 DROP 或有拦截规则。
+  # 上一版只看 ufw/firewalld，所以反代端口实际被 iptables 拦掉。
+  if command -v iptables >/dev/null 2>&1; then
+    local pol; pol=$(iptables -L INPUT -n 2>/dev/null | head -1)
+    if echo "$pol" | grep -q 'policy DROP' || iptables -L INPUT -n 2>/dev/null | grep -qE '^(DROP|REJECT)'; then
+      if ! iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; then
+        iptables -I INPUT 1 -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
+          && { ok "iptables 已放行 $p/tcp"; done_any=1; }
+      else
+        ok "iptables 已有 $p/tcp 放行规则"; done_any=1
+      fi
+      # 尽力持久化
+      if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || true
+      elif [ -d /etc/iptables ]; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+      fi
+    fi
+  fi
+  [ "$done_any" = 1 ] || warn "本机未发现防火墙拦截"
+  warn "❗ 云厂商安全组需你自己在控制台放行 $p/tcp（脚本改不了）"
 }
 
 # ================= 服务器 A：用户入口 + portal =================
@@ -262,7 +288,18 @@ deploy_a(){
   local uport="${ATT_PORT:-443}"
   case "$uport" in (*[!0-9]*) die "ATT_PORT 必须是数字";; esac
 
-  local aip; aip=$(pubip); [ -n "$aip" ] || die "无法获取本机公网 IP"
+  local aip; aip=$(pubip) || true
+  if [ -z "${aip:-}" ]; then
+    echo
+    echo "${RED}无法获取本机公网 IP${RST}（请求 api.ipify.org / ifconfig.me 超时）"
+    echo "常见原因："
+    echo "  • 本机防火墙 INPUT/OUTPUT 默认 DROP，连 DNS 都出不去"
+    echo "    检查：${CYN}iptables -L INPUT -n | head -3${RST}"
+    echo "  • DNS 不可用：${CYN}cat /etc/resolv.conf; ping -c1 1.1.1.1${RST}"
+    echo
+    echo "也可以直接指定：${CYN}ATT_IP=你的公网IP bash install.sh --server-a${RST}"
+    die "已停止"
+  fi
   info "本机公网 IP: $aip（B 端将直连此 IP，A 的 IP 不要变）"
   [ "$uport" = 443 ] || warn "使用非默认入口端口: $uport"
 
@@ -301,7 +338,6 @@ deploy_a(){
   local rport; rport=$(free_port)
   local uuid buuid sid path priv pub dec enc
   uuid=$("$XRAY_BIN" uuid)
-  local uuid2; uuid2=$("$XRAY_BIN" uuid)
   buuid=$("$XRAY_BIN" uuid)
   sid=$(openssl rand -hex 8)
   path="/$(openssl rand -hex 12)"
@@ -326,12 +362,10 @@ deploy_a(){
   local a_clients a_users
   if [ "$ATT_TRANSPORT" = xhttp ]; then
     a_clients="{ \"id\": \"$uuid\", \"email\": \"node1\" }"
-    a_users='"node1"'
   else
-    a_clients="{ \"id\": \"$uuid\", \"email\": \"node1\", \"flow\": \"xtls-rprx-vision\" },
-          { \"id\": \"$uuid2\", \"email\": \"node1-compat\" }"
-    a_users='"node1", "node1-compat"'
+    a_clients="{ \"id\": \"$uuid\", \"email\": \"node1\", \"flow\": \"xtls-rprx-vision\" }"
   fi
+  a_users='"node1"'
 
   local a_net
   if [ "$ATT_TRANSPORT" = xhttp ]; then
@@ -431,6 +465,28 @@ EOF
 
   echo
   echo "${BLD}=========== 服务器 A 部署完成 ===========${RST}"
+  echo
+  # 从外部视角验证反代端口真的通，否则 B 端会白跑一轮
+  echo
+  info "验证反代端口 $rport 是否从外网可达 ..."
+  local probe_ok=0 body
+  body=$(curl -fsS --max-time 20 "https://ports.yougetsignal.com/check-port.php" \
+         --data "remoteAddress=$aip&portNumber=$rport" 2>/dev/null || true)
+  if echo "$body" | grep -qi 'open'; then
+    probe_ok=1
+  fi
+  if [ "$probe_ok" = 1 ]; then
+    ok "外网可达 $aip:$rport"
+  else
+    echo
+    echo "${YEL}${BLD}⚠ 外网似乎连不上 $aip:$rport${RST}"
+    echo "这样 B 端隧道建不起来。本机防火墙已处理，请检查："
+    echo "  • ${BLD}云厂商安全组${RST}是否放行 ${BLD}$rport/tcp${RST}（最常见原因）"
+    echo "  • 上游服务商是否限制端口"
+    echo "放行后隧道会自动建立，不用重跑本脚本。"
+    echo "（探测服务可能不准，若你确定已放行可忽略）"
+  fi
+
   echo
   echo "${BLD}下一步：到服务器 B（AT&T 出口机）上执行：${RST}"
   echo
@@ -570,8 +626,15 @@ EOF
   if [ "$estab" = 1 ]; then
     ok "反向隧道已建立（B → A ESTAB）"
   else
-    warn "暂未看到 ESTAB。排查：A 上是否放行 $rport/tcp（含云安全组）"
-    warn "手动查看：ss -tnp | grep $rport   /   journalctl -u xray -n 30"
+    echo "${YEL}${BLD}⚠ 隧道未建立${RST}"
+    echo "B 已部署完成并会持续重试，卡在这里只有一个原因："
+    echo "  ${BLD}A 机的 $rport/tcp 没有对外开放${RST}"
+    echo
+    echo "去 A 机的${BLD}云厂商控制台安全组${RST}放行 ${BLD}$rport/tcp${RST}（入方向）。"
+    echo "放行后无需重跑任何命令，30 秒内隧道会自动建立。"
+    echo
+    echo "确认方法（本机）：${CYN}ss -tn state established | grep $rport${RST}"
+    echo "或直接测连通：  ${CYN}timeout 5 bash -c '</dev/tcp/$aip/$rport' && echo 通 || echo 不通${RST}"
   fi
   echo
   ok "B 端无任何入站监听，公网扫不到"
@@ -601,13 +664,7 @@ show_links(){
       qs="type=tcp"
     fi
     echo
-    if [ "$fl" = "xtls-rprx-vision" ]; then
-      echo "${CYN}[$n]${RST} ${GRN}(Vision，抗封更好，优先用这个)${RST}"
-    elif [ "$tr" != xhttp ]; then
-      echo "${CYN}[$n]${RST} ${YEL}(兼容版，客户端不支持 Vision 时用)${RST}"
-    else
-      echo "${CYN}[$n]${RST}"
-    fi
+    echo "${CYN}[$n]${RST}"
     echo "vless://$uuid@$A_IP:$uport?encryption=none&security=reality&$qs&sni=$SNI&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID#$n"
   done < <("$XRAY_BIN" -test -config "$CFG" >/dev/null 2>&1 && ATT_CFG="$CFG" python3 - <<'PY'
 import json,os
@@ -619,7 +676,10 @@ for ib in d['inbounds']:
 PY
 )
   echo
-  [ "$tr" = xhttp ] || echo "${BLD}提示：${RST}两条链接都能用。Vision 那条抗封更好；若客户端连不上（报 EOF/502），换兼容版那条。"
+  if [ "$tr" != xhttp ]; then
+    echo "${BLD}客户端必须带上 ${GRN}flow=xtls-rprx-vision${RST}${BLD}（导入后请核对）${RST}"
+    echo "若报 EOF / 502，几乎肯定是客户端丢了 flow 参数。"
+  fi
 }
 
 add_node(){
@@ -630,33 +690,27 @@ add_node(){
   [ -n "$name" ] || die "名称不能为空"
   local uuid; uuid=$("$XRAY_BIN" uuid)
   local tmp; tmp=$(mktemp --suffix=.json)
-  local uuid2b; uuid2b=$("$XRAY_BIN" uuid)
-  NEW_NAME="$name" NEW_UUID="$uuid" NEW_UUID2="$uuid2b" ATT_CFG="$CFG" python3 - > "$tmp" <<'PY'
+  NEW_NAME="$name" NEW_UUID="$uuid" ATT_CFG="$CFG" python3 - > "$tmp" <<'PY'
 import json,os
 d=json.load(open(os.environ['ATT_CFG']))
-name=os.environ['NEW_NAME']; uuid=os.environ['NEW_UUID']; uuid2=os.environ['NEW_UUID2']
-# 与部署时一致：raw 模式下同时建 Vision 版和兼容版
+name=os.environ['NEW_NAME']; uuid=os.environ['NEW_UUID']
+# raw 模式必带 Vision（抗封）；xhttp 不支持 flow
 vision=False
 for ib in d['inbounds']:
-    if ib.get('tag')=='user-in':
-        if ib['streamSettings'].get('network')=='raw':
-            vision=True
-names=[name]+([name+'-compat'] if vision else [])
+    if ib.get('tag')=='user-in' and ib['streamSettings'].get('network')=='raw':
+        vision=True
 for ib in d['inbounds']:
     if ib.get('tag')=='user-in':
         cs=ib['settings']['clients']
-        if any(c.get('email') in names for c in cs):
+        if any(c.get('email')==name for c in cs):
             raise SystemExit('DUP')
+        c={'id':uuid,'email':name}
         if vision:
-            cs.append({'id':uuid,'email':name,'flow':'xtls-rprx-vision'})
-            cs.append({'id':uuid2,'email':name+'-compat'})
-        else:
-            cs.append({'id':uuid,'email':name})
+            c['flow']='xtls-rprx-vision'
+        cs.append(c)
 for r in d['routing']['rules']:
-    if 'user' in r:
-        for nm in names:
-            if nm not in r['user']:
-                r['user'].append(nm)
+    if 'user' in r and name not in r['user']:
+        r['user'].append(name)
 print(json.dumps(d,indent=1))
 PY
   [ -s "$tmp" ] || die "节点名已存在或配置解析失败"
