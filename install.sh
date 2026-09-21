@@ -3,7 +3,7 @@
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
 set -euo pipefail
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -301,6 +301,7 @@ deploy_a(){
   local rport; rport=$(free_port)
   local uuid buuid sid path priv pub dec enc
   uuid=$("$XRAY_BIN" uuid)
+  local uuid2; uuid2=$("$XRAY_BIN" uuid)
   buuid=$("$XRAY_BIN" uuid)
   sid=$(openssl rand -hex 8)
   path="/$(openssl rand -hex 12)"
@@ -316,8 +317,21 @@ deploy_a(){
   #   new: portal 声明在 reverse-in 的 user 上，无顶层 reverse / 无 tunnel.internal 路由
   #   old: 顶层 reverse.portals + 虚拟域名路由
   # XTLS Vision：消除 TLS-in-TLS 指纹，抗封关键。仅 raw 可用，xhttp 不支持 flow。
-  local a_flow=""
-  [ "$ATT_TRANSPORT" = xhttp ] || a_flow=', "flow": "xtls-rprx-vision"'
+  # 坑：flow 必须两端完全一致。服务端有 Vision 而客户端没填 flow 时，
+  # Xray 直接拒绝（日志：rejected since the client flow is empty），
+  # 客户端表现为 EOF / 502。很多客户端导入链接时会丢掉 flow 参数。
+  # 所以 raw 模式同时建两个用户（不同 UUID）：
+  #   node1        带 Vision —— 抗封更好，优先用
+  #   node1-compat 不带 flow —— 客户端不支持 Vision 时的保底
+  local a_clients a_users
+  if [ "$ATT_TRANSPORT" = xhttp ]; then
+    a_clients="{ \"id\": \"$uuid\", \"email\": \"node1\" }"
+    a_users='"node1"'
+  else
+    a_clients="{ \"id\": \"$uuid\", \"email\": \"node1\", \"flow\": \"xtls-rprx-vision\" },
+          { \"id\": \"$uuid2\", \"email\": \"node1-compat\" }"
+    a_users='"node1", "node1-compat"'
+  fi
 
   local a_net
   if [ "$ATT_TRANSPORT" = xhttp ]; then
@@ -350,7 +364,7 @@ $a_reverse_blk
       "port": $uport,
       "protocol": "vless",
       "settings": {
-        "clients": [ { "id": "$uuid", "email": "node1"$a_flow } ],
+        "clients": [ $a_clients ],
         "decryption": "none"
       },
       "streamSettings": {
@@ -383,7 +397,7 @@ $a_reverse_blk
   "routing": {
     "rules": [
 $a_extra_rule
-      { "type": "field", "user": [ "node1" ], "outboundTag": "portal" }
+      { "type": "field", "user": [ $a_users ], "outboundTag": "portal" }
     ]
   }
 }
@@ -573,18 +587,27 @@ show_links(){
   source "$STATE/a.env"
   echo "${BLD}--- 客户端分享链接 ---${RST}"
   local epath; epath=$(printf '%s' "$XPATH" | sed 's|/|%2F|g')
-  local tr="${TRANSPORT:-xhttp}" qs
-  if [ "$tr" = xhttp ]; then
-    qs="type=xhttp&path=$epath&mode=auto"
-  else
-    qs="type=tcp&flow=xtls-rprx-vision"
-  fi
+  local tr="${TRANSPORT:-xhttp}"
   local uport="${USER_PORT:-443}"
-  local n uuid
-  while read -r n uuid; do
+  local n uuid fl qs
+  # flow 由每个用户自己的配置决定，不能一刀切
+  while read -r n uuid fl; do
     [ -z "$n" ] && continue
+    if [ "$tr" = xhttp ]; then
+      qs="type=xhttp&path=$epath&mode=auto"
+    elif [ "$fl" = "xtls-rprx-vision" ]; then
+      qs="type=tcp&flow=xtls-rprx-vision"
+    else
+      qs="type=tcp"
+    fi
     echo
-    echo "${CYN}[$n]${RST}"
+    if [ "$fl" = "xtls-rprx-vision" ]; then
+      echo "${CYN}[$n]${RST} ${GRN}(Vision，抗封更好，优先用这个)${RST}"
+    elif [ "$tr" != xhttp ]; then
+      echo "${CYN}[$n]${RST} ${YEL}(兼容版，客户端不支持 Vision 时用)${RST}"
+    else
+      echo "${CYN}[$n]${RST}"
+    fi
     echo "vless://$uuid@$A_IP:$uport?encryption=none&security=reality&$qs&sni=$SNI&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID#$n"
   done < <("$XRAY_BIN" -test -config "$CFG" >/dev/null 2>&1 && ATT_CFG="$CFG" python3 - <<'PY'
 import json,os
@@ -592,10 +615,11 @@ d=json.load(open(os.environ['ATT_CFG']))
 for ib in d['inbounds']:
     if ib.get('tag')=='user-in':
         for c in ib['settings']['clients']:
-            print(c.get('email','node'), c['id'])
+            print(c.get('email','node'), c['id'], c.get('flow',''))
 PY
 )
   echo
+  [ "$tr" = xhttp ] || echo "${BLD}提示：${RST}两条链接都能用。Vision 那条抗封更好；若客户端连不上（报 EOF/502），换兼容版那条。"
 }
 
 add_node(){
@@ -606,19 +630,33 @@ add_node(){
   [ -n "$name" ] || die "名称不能为空"
   local uuid; uuid=$("$XRAY_BIN" uuid)
   local tmp; tmp=$(mktemp --suffix=.json)
-  NEW_NAME="$name" NEW_UUID="$uuid" ATT_CFG="$CFG" python3 - > "$tmp" <<'PY'
+  local uuid2b; uuid2b=$("$XRAY_BIN" uuid)
+  NEW_NAME="$name" NEW_UUID="$uuid" NEW_UUID2="$uuid2b" ATT_CFG="$CFG" python3 - > "$tmp" <<'PY'
 import json,os
 d=json.load(open(os.environ['ATT_CFG']))
-name=os.environ['NEW_NAME']; uuid=os.environ['NEW_UUID']
+name=os.environ['NEW_NAME']; uuid=os.environ['NEW_UUID']; uuid2=os.environ['NEW_UUID2']
+# 与部署时一致：raw 模式下同时建 Vision 版和兼容版
+vision=False
+for ib in d['inbounds']:
+    if ib.get('tag')=='user-in':
+        if ib['streamSettings'].get('network')=='raw':
+            vision=True
+names=[name]+([name+'-compat'] if vision else [])
 for ib in d['inbounds']:
     if ib.get('tag')=='user-in':
         cs=ib['settings']['clients']
-        if any(c.get('email')==name for c in cs):
+        if any(c.get('email') in names for c in cs):
             raise SystemExit('DUP')
-        cs.append({'id':uuid,'email':name})
+        if vision:
+            cs.append({'id':uuid,'email':name,'flow':'xtls-rprx-vision'})
+            cs.append({'id':uuid2,'email':name+'-compat'})
+        else:
+            cs.append({'id':uuid,'email':name})
 for r in d['routing']['rules']:
-    if 'user' in r and name not in r['user']:
-        r['user'].append(name)
+    if 'user' in r:
+        for nm in names:
+            if nm not in r['user']:
+                r['user'].append(nm)
 print(json.dumps(d,indent=1))
 PY
   [ -s "$tmp" ] || die "节点名已存在或配置解析失败"
