@@ -3,7 +3,7 @@
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
 set -euo pipefail
 
-VERSION="1.8.0"
+VERSION="1.9.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -316,12 +316,15 @@ deploy_a(){
       die "已停止，没有动你现有服务"
     fi
 
-    # 自动改用备选端口，按「像 HTTPS」的程度排序
-    local cand p
-    for p in 8443 2053 2083 2087 2096 8080; do
-      ss -ltn 2>/dev/null | grep -q ":$p " || { cand=$p; break; }
-    done
-    [ -n "${cand:-}" ] || cand=$(free_port)
+    # 降级顺序：443 -> 8443 -> 随机高位端口
+    local cand=""
+    if ! ss -ltn 2>/dev/null | grep -q ':8443 '; then
+      cand=8443
+      info "8443 空闲，改用 8443"
+    else
+      warn "8443 也被占用，改用随机高位端口"
+      cand=$(free_port)
+    fi
 
     uport="$cand"
     echo

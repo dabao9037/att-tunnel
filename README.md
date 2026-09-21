@@ -39,7 +39,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-tunnel/main/in
 
 要求：443 未被占用、公网 IP 固定（不绑域名的代价就是 A 的 IP 不能变）。
 
-**443 被占用也能直接跑。** 脚本会自动改用 8443（依次尝试 8443/2053/2083/2087/2096/8080）继续部署，**不会动你占用 443 的服务**。想自己指定：
+**端口自动降级：`443` → `8443` → 随机高位端口。** 443 空闲就用 443；被占就用 8443；8443 也被占就选一个随机高位端口。全程**不会动你已有的服务**。想自己指定：
 
 ```bash
 ATT_PORT=8443 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-tunnel/main/install.sh) --server-a
