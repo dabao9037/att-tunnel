@@ -47,6 +47,19 @@ ATT_PORT=8443 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-
 
 注意：非 443 的 REALITY 伪装效果会打折（Xray 自己也会告警）。能腾出 443 就腾。
 
+**传输方式默认 RAW（`type=tcp`）**，所有客户端都支持。
+
+> 之前默认 XHTTP，客户端不支持或未正确配置时会报
+> `unexpected response version. Expecting 0 but actually 72`
+> （72 = 字符 `H`，即 VLESS 层收到明文 HTTP）。
+> 常见于 Clash / Mihomo 系客户端（它们用 `cp.cloudflare.com` 做健康检查，所以错误里常带这个地址）。
+
+想用 XHTTP（伪装更好，但客户端必须支持）：
+
+```bash
+ATT_TRANSPORT=xhttp bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-tunnel/main/install.sh) --server-a
+```
+
 **Xray 版本强制 v26.6.27**（26.7 及以后的版本有 bug）。本工具只用自己那份 `/usr/local/bin/xray`，**不复用机器上其他版本**；发现版本不对会自动卸载重装。
 
 > A/B 两端 Xray 版本必须一致。不一致时客户端会报

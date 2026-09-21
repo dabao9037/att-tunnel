@@ -3,7 +3,7 @@
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
 set -euo pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -15,6 +15,10 @@ REVERSE_STYLE="new"   # 由 install_xray 实测覆盖：new=VLESS Reverse Proxy 
 # 固定 Xray 版本：26.7 及以后的版本有 bug，钉在 2026 年 6 月最后一版。
 # 需要时可用 ATT_XRAY_VER 覆盖（例：ATT_XRAY_VER=v26.6.22）。
 XRAY_VER="${ATT_XRAY_VER:-v26.6.27}"
+# 用户入口传输方式：raw（默认，兼容所有客户端）| xhttp（伪装更好，但要求客户端支持）
+# 客户端若不支持/未正确配置 XHTTP，会报 unexpected response version ... actually 72
+# （72 = 'H'，VLESS 层收到明文 HTTP）。所以默认用 raw。
+ATT_TRANSPORT="${ATT_TRANSPORT:-raw}"
 
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYN=$'\033[36m'; BLD=$'\033[1m'; RST=$'\033[0m'
 info(){ echo "${CYN}==>${RST} $*"; }
@@ -311,6 +315,14 @@ deploy_a(){
   # 新/旧 reverse 语法差异：
   #   new: portal 声明在 reverse-in 的 user 上，无顶层 reverse / 无 tunnel.internal 路由
   #   old: 顶层 reverse.portals + 虚拟域名路由
+  local a_net
+  if [ "$ATT_TRANSPORT" = xhttp ]; then
+    a_net="\"network\": \"xhttp\",
+        \"xhttpSettings\": { \"path\": \"$path\", \"mode\": \"auto\" },"
+  else
+    a_net="\"network\": \"raw\","
+  fi
+
   local a_reverse_blk a_bclient a_extra_rule
   if [ "$REVERSE_STYLE" = new ]; then
     a_reverse_blk=""
@@ -338,9 +350,8 @@ $a_reverse_blk
         "decryption": "none"
       },
       "streamSettings": {
-        "network": "xhttp",
+        $a_net
         "security": "reality",
-        "xhttpSettings": { "path": "$path", "mode": "auto" },
         "realitySettings": {
           "target": "$sni:443",
           "serverNames": [ "$sni" ],
@@ -389,6 +400,7 @@ REVERSE_PORT=$rport
 SNI=$sni
 SHORT_ID=$sid
 XPATH=$path
+TRANSPORT=$ATT_TRANSPORT
 REALITY_PUB=$pub
 BRIDGE_UUID=$buuid
 VLESS_ENC=$enc
@@ -557,13 +569,19 @@ show_links(){
   source "$STATE/a.env"
   echo "${BLD}--- 客户端分享链接 ---${RST}"
   local epath; epath=$(printf '%s' "$XPATH" | sed 's|/|%2F|g')
+  local tr="${TRANSPORT:-xhttp}" qs
+  if [ "$tr" = xhttp ]; then
+    qs="type=xhttp&path=$epath&mode=auto"
+  else
+    qs="type=tcp"
+  fi
   local uport="${USER_PORT:-443}"
   local n uuid
   while read -r n uuid; do
     [ -z "$n" ] && continue
     echo
     echo "${CYN}[$n]${RST}"
-    echo "vless://$uuid@$A_IP:$uport?encryption=none&security=reality&type=xhttp&path=$epath&mode=auto&sni=$SNI&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID#$n"
+    echo "vless://$uuid@$A_IP:$uport?encryption=none&security=reality&$qs&sni=$SNI&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID#$n"
   done < <("$XRAY_BIN" -test -config "$CFG" >/dev/null 2>&1 && ATT_CFG="$CFG" python3 - <<'PY'
 import json,os
 d=json.load(open(os.environ['ATT_CFG']))
