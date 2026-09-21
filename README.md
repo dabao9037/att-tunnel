@@ -47,7 +47,12 @@ ATT_PORT=8443 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-
 
 注意：非 443 的 REALITY 伪装效果会打折（Xray 自己也会告警）。能腾出 443 就腾。
 
-**Xray 版本钉在 v26.6.27**（26.7 及以后的版本有 bug）。需要换版本：
+**Xray 版本强制 v26.6.27**（26.7 及以后的版本有 bug）。本工具只用自己那份 `/usr/local/bin/xray`，**不复用机器上其他版本**；发现版本不对会自动卸载重装。
+
+> A/B 两端 Xray 版本必须一致。不一致时客户端会报
+> `unknown version: 72`（72 = 字符 `H`，即收到明文 HTTP 而不是 VLESS）。
+
+需要换版本（两端都要改）：
 
 ```bash
 ATT_XRAY_VER=v26.6.22 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-tunnel/main/install.sh) --server-a

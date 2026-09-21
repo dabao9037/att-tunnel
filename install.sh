@@ -3,7 +3,7 @@
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -37,37 +37,13 @@ install_deps(){
   else die "无法自动安装依赖，请手动安装: ${miss[*]}"; fi
 }
 
-install_xray(){
-  # 已有 xray 就用，不重装（可能是 3x-ui / 宝塔 / 手动装的）
-  local found=""
-  if [ "${ATT_FORCE_INSTALL:-0}" = 1 ]; then
-    found=""
-  elif [ -n "${XRAY_BIN:-}" ] && [ -x "${XRAY_BIN:-}" ]; then
-    found="$XRAY_BIN"
-  elif command -v xray >/dev/null 2>&1; then
-    found=$(command -v xray)
-  else
-    local p
-    for p in /usr/bin/xray /opt/xray/xray /usr/local/xray/xray \
-             /usr/local/x-ui/bin/xray-linux-amd64 /etc/x-ui/bin/xray-linux-amd64 \
-             /opt/nodelite/bin/xray; do
-      [ -x "$p" ] && { found="$p"; break; }
-    done
-  fi
-
-  if [ -n "$found" ]; then
-    XRAY_BIN="$found"
-    local ver; ver=$("$XRAY_BIN" version 2>/dev/null | head -1)
-    if [ -z "$ver" ]; then
-      warn "找到 $found 但无法执行，尝试重新安装"
-    else
-      ok "复用已有 Xray: $ver"
-      echo "    路径: $XRAY_BIN"
-      # 探测该版本用哪一代 reverse 语法：
-      #   new = VLESS Reverse Proxy（user 内 "reverse":{"tag"}），26.4+ 已强制
-      #   old = 顶层 "reverse":{portals/bridges}，旧版
-      local probe; probe=$(mktemp --suffix=.json)
-      cat > "$probe" <<'PROBE'
+# 探测该 Xray 用哪一代 reverse 语法：
+#   new = VLESS Reverse Proxy（user 内 "reverse":{"tag"}），26.4+ 起强制
+#   old = 顶层 "reverse":{portals/bridges}
+# 判别用 simplified outbound style：旧版会因 "vnext" is empty 直接失败。
+detect_reverse_style(){
+  local probe; probe=$(mktemp --suffix=.json)
+  cat > "$probe" <<'PROBE'
 { "log": { "loglevel": "warning" },
   "inbounds": [],
   "outbounds": [
@@ -79,39 +55,48 @@ install_xray(){
     { "tag": "f", "protocol": "freedom" } ],
   "routing": { "rules": [ { "type": "field", "inboundTag": [ "bridge" ], "outboundTag": "f" } ] } }
 PROBE
-      if "$XRAY_BIN" -test -config "$probe" >/dev/null 2>&1; then
-        REVERSE_STYLE=new
-        ok "版本支持新版 VLESS Reverse + XHTTP"
-        rm -f "$probe"
-        return 0
-      fi
-      cat > "$probe" <<'PROBE'
-{ "log": { "loglevel": "warning" },
-  "reverse": { "portals": [ { "tag": "p", "domain": "t.internal" } ] },
-  "inbounds": [ { "tag": "i", "listen": "127.0.0.1", "port": 65533, "protocol": "vless",
-    "settings": { "clients": [ { "id": "11111111-1111-1111-1111-111111111111" } ], "decryption": "none" },
-    "streamSettings": { "network": "xhttp", "xhttpSettings": { "path": "/p", "mode": "auto" } } } ],
-  "outbounds": [ { "protocol": "freedom" } ],
-  "routing": { "rules": [ { "type": "field", "inboundTag": [ "i" ], "outboundTag": "p" } ] } }
-PROBE
-      if "$XRAY_BIN" -test -config "$probe" >/dev/null 2>&1; then
-        REVERSE_STYLE=old
-        ok "版本支持旧版 reverse + XHTTP"
-        rm -f "$probe"
-        return 0
-      fi
-      rm -f "$probe"
-      warn "当前 Xray 两种 reverse 语法都不支持（版本过旧？）"
+  if "$XRAY_BIN" -test -config "$probe" >/dev/null 2>&1; then
+    REVERSE_STYLE=new
+  else
+    REVERSE_STYLE=old
+  fi
+  rm -f "$probe"
+  ok "reverse 语法：$REVERSE_STYLE"
+}
 
-      # 关键：绝不覆盖别人的 xray（NodeLite / 3x-ui / 宝塔等）
-      if [ "$XRAY_BIN" != "/usr/local/bin/xray" ]; then
-        echo
-        echo "检测到的 Xray 在 ${BLD}$XRAY_BIN${RST}，它很可能属于其他面板（如 NodeLite / 3x-ui）。"
-        echo "我${BLD}不会${RST}去覆盖它，以免弄坏你现有面板。"
-        echo "将单独安装一份到 /usr/local/bin/xray 给本工具自己用。"
-        echo
-      fi
-    fi
+install_xray(){
+  # 本工具专用副本固定用 $XRAY_VER，绝不复用机器上别的版本。
+  # 原因：A/B 两端 Xray 版本不一致会导致握手失败，客户端报
+  #   unknown version: 72  （72 = 'H'，即收到明文 HTTP 而非 VLESS）
+  # 所以只认 /usr/local/bin/xray，且版本号必须等于 $XRAY_VER。
+  local want="${XRAY_VER#v}"
+  local cur=""
+  if [ -x /usr/local/bin/xray ]; then
+    cur=$(/usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}')
+  fi
+
+  if [ -n "$cur" ] && [ "$cur" = "$want" ]; then
+    XRAY_BIN="/usr/local/bin/xray"
+    ok "专用 Xray 已是 $cur（$XRAY_BIN）"
+    detect_reverse_style
+    return 0
+  fi
+
+  if [ -n "$cur" ]; then
+    warn "专用 Xray 版本是 $cur，需要 $want —— 卸载重装"
+    systemctl stop "$SVC" 2>/dev/null || true
+    rm -f /usr/local/bin/xray
+  fi
+
+  # 提示一下机器上别的 xray，但明确不碰它
+  local other p
+  for p in /opt/nodelite/bin/xray /usr/bin/xray /opt/xray/xray \
+           /usr/local/x-ui/bin/xray-linux-amd64 /etc/x-ui/bin/xray-linux-amd64; do
+    [ -x "$p" ] && { other="$p"; break; }
+  done
+  if [ -n "${other:-}" ]; then
+    local ov; ov=$("$other" version 2>/dev/null | head -1 | awk '{print $2}')
+    info "检测到其他 Xray：$other（$ov）—— 不使用、不修改它"
   fi
 
   info "安装专用 Xray-core $XRAY_VER 到 /usr/local/bin/xray ..."
@@ -146,27 +131,7 @@ PROBE
   [ -x "$XRAY_BIN" ] || die "安装后未找到 $XRAY_BIN"
   ok "Xray 已安装: $("$XRAY_BIN" version | head -1)"
 
-  # 新装的肯定是新语法，但还是实测一下
-  local probe; probe=$(mktemp --suffix=.json)
-  cat > "$probe" <<'PROBE'
-{ "log": { "loglevel": "warning" },
-  "inbounds": [],
-  "outbounds": [
-    { "tag": "t", "protocol": "vless",
-      "settings": { "address": "127.0.0.1", "port": 12345,
-        "id": "11111111-1111-1111-1111-111111111111", "encryption": "none",
-        "reverse": { "tag": "bridge" } },
-      "streamSettings": { "network": "raw" } },
-    { "tag": "f", "protocol": "freedom" } ],
-  "routing": { "rules": [ { "type": "field", "inboundTag": [ "bridge" ], "outboundTag": "f" } ] } }
-PROBE
-  if "$XRAY_BIN" -test -config "$probe" >/dev/null 2>&1; then
-    REVERSE_STYLE=new
-  else
-    REVERSE_STYLE=old
-  fi
-  rm -f "$probe"
-  ok "reverse 语法：$REVERSE_STYLE"
+  detect_reverse_style
 }
 
 # ---------- 回落域名：实测可用才用（文档坑：microsoft 在新版会握手失败） ----------
@@ -289,12 +254,6 @@ open_fw(){
 deploy_a(){
   need_root; install_deps; install_xray
 
-  # A 端优先用新语法：若复用到的是老版 xray，另装一份新版给本工具专用
-  if [ "$REVERSE_STYLE" = old ]; then
-    warn "复用到的 Xray 是旧 reverse 语法；为兼容性另装一份新版给本工具专用"
-    XRAY_BIN=""
-    ATT_FORCE_INSTALL=1 install_xray
-  fi
 
   local uport="${ATT_PORT:-443}"
   case "$uport" in (*[!0-9]*) die "ATT_PORT 必须是数字";; esac
@@ -465,18 +424,12 @@ deploy_b(){
 
   install_deps; install_xray
 
-  # B 必须跟 A 用同一代语法；老 token 没带 style 时用本机探测结果
+  # A/B 两端都强制同一个 $XRAY_VER，语法必然一致。若 token 带的 style 不一致，
+  # 说明 A 端是用旧版本部署的，必须让 A 也重跑一次，否则握手会失败
+  # （客户端报 unknown version: 72）。
   if [ -n "${tstyle:-}" ] && [ "$tstyle" != "$REVERSE_STYLE" ]; then
-    warn "A 用 $tstyle 语法，本机找到的 Xray 是 $REVERSE_STYLE"
-    if [ "$tstyle" = new ]; then
-      info "另装一份新版 Xray 到 /usr/local/bin/xray 给本工具用（不动 $XRAY_BIN）"
-      XRAY_BIN=""          # 强制走安装分支
-      ATT_FORCE_INSTALL=1 install_xray
-      [ "$REVERSE_STYLE" = new ] || die "新装的 Xray 仍不支持新语法，请反馈"
-    else
-      warn "按 A 的旧语法生成配置"
-      REVERSE_STYLE="$tstyle"
-    fi
+    warn "A 端 reverse 语法是 $tstyle，本机是 $REVERSE_STYLE —— 两端 Xray 版本不一致"
+    die "请在 A 端用同一版脚本重跑菜单 1，拿到新 token 再回来"
   fi
 
   info "将主动拨向 A: $aip:$rport（reverse 语法 $REVERSE_STYLE）"
@@ -656,6 +609,14 @@ PY
 selfcheck(){
   echo "${BLD}--- 运行自检 ---${RST}"
   if systemctl is-active --quiet "$SVC"; then ok "$SVC active"; else echo "${RED}[X]${RST} $SVC 未运行"; fi
+  if [ -x /usr/local/bin/xray ]; then
+    local xv; xv=$(/usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}')
+    if [ "$xv" = "${XRAY_VER#v}" ]; then
+      ok "专用 Xray 版本 $xv（两端必须一致）"
+    else
+      warn "专用 Xray 版本 $xv，期望 ${XRAY_VER#v} —— 重跑脚本会自动换成期望版本"
+    fi
+  fi
 
   if [ -f "$STATE/a.env" ]; then
     source "$STATE/a.env"
