@@ -47,6 +47,19 @@ ATT_PORT=8443 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-
 
 注意：非 443 的 REALITY 伪装效果会打折（Xray 自己也会告警）。能腾出 443 就腾。
 
+## 抗封说明
+
+默认配置是 **VLESS + REALITY + XTLS Vision over TCP**，这是 REALITY 设计时的主用场景，也是目前社区最主流的抗封组合：
+
+- **REALITY**：没有自签证书、不需域名。对外展示的是真实站点（默认 `www.atlasobscura.com`）的**真证书**；被主动探测时流量直接回落到该真站，探测者看不出异常。
+  实测：从外部 `openssl s_client` 直连 A:443，得到 `subject=CN = atlasobscura.com`、`issuer=Google Trust Services`、`Verify return code: 0 (ok)`。
+- **XTLS Vision**（`flow=xtls-rprx-vision`）：消除 TLS-in-TLS 指纹。没有它的话，TCP+REALITY 的内层 TLS 握手会在外层 TLS 里形成可识别特征。这是抗封的关键项。
+- **端口建议用 443**。非 443 的 TLS 流量本身就显眼，Xray 自己也会对此告警。
+
+关于传输方式：有人认为 XHTTP 伪装更好（看起来像 HTTP/2 访问），但它**不能与 Vision 共用**，而且 Clash/Mihomo 系客户端支持不完整。权衷之下默认选 **RAW + Vision**：兼容所有客户端，且指纹特征更小。
+
+剩下的风险不在协议层：**回落域名要选你所在网络真实访问得通、且流量量级合理的站**（默认那批均已实测 REALITY 握手可用）；以及不要把节点做成公开代理。
+
 **传输方式默认 RAW（`type=tcp`）**，所有客户端都支持。
 
 > 之前默认 XHTTP，客户端不支持或未正确配置时会报

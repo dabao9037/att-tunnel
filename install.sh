@@ -3,7 +3,7 @@
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
 set -euo pipefail
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -315,6 +315,10 @@ deploy_a(){
   # 新/旧 reverse 语法差异：
   #   new: portal 声明在 reverse-in 的 user 上，无顶层 reverse / 无 tunnel.internal 路由
   #   old: 顶层 reverse.portals + 虚拟域名路由
+  # XTLS Vision：消除 TLS-in-TLS 指纹，抗封关键。仅 raw 可用，xhttp 不支持 flow。
+  local a_flow=""
+  [ "$ATT_TRANSPORT" = xhttp ] || a_flow=', "flow": "xtls-rprx-vision"'
+
   local a_net
   if [ "$ATT_TRANSPORT" = xhttp ]; then
     a_net="\"network\": \"xhttp\",
@@ -346,7 +350,7 @@ $a_reverse_blk
       "port": $uport,
       "protocol": "vless",
       "settings": {
-        "clients": [ { "id": "$uuid", "email": "node1" } ],
+        "clients": [ { "id": "$uuid", "email": "node1"$a_flow } ],
         "decryption": "none"
       },
       "streamSettings": {
@@ -573,7 +577,7 @@ show_links(){
   if [ "$tr" = xhttp ]; then
     qs="type=xhttp&path=$epath&mode=auto"
   else
-    qs="type=tcp"
+    qs="type=tcp&flow=xtls-rprx-vision"
   fi
   local uport="${USER_PORT:-443}"
   local n uuid
