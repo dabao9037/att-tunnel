@@ -32,14 +32,68 @@ install_deps(){
 }
 
 install_xray(){
+  # 已有 xray 就用，不重装（可能是 3x-ui / 宝塔 / 手动装的）
+  local found=""
   if [ -x "$XRAY_BIN" ]; then
-    ok "Xray 已安装: $("$XRAY_BIN" version | head -1)"
-    return 0
+    found="$XRAY_BIN"
+  elif command -v xray >/dev/null 2>&1; then
+    found=$(command -v xray)
+  else
+    local p
+    for p in /usr/bin/xray /opt/xray/xray /usr/local/xray/xray \
+             /usr/local/x-ui/bin/xray-linux-amd64 /etc/x-ui/bin/xray-linux-amd64 \
+             /opt/nodelite/bin/xray; do
+      [ -x "$p" ] && { found="$p"; break; }
+    done
   fi
+
+  if [ -n "$found" ]; then
+    XRAY_BIN="$found"
+    local ver; ver=$("$XRAY_BIN" version 2>/dev/null | head -1)
+    if [ -z "$ver" ]; then
+      warn "找到 $found 但无法执行，尝试重新安装"
+    else
+      ok "复用已有 Xray: $ver"
+      echo "    路径: $XRAY_BIN"
+      # Reverse + XHTTP 需要较新版本，先用真实配置探一下
+      local probe; probe=$(mktemp --suffix=.json)
+      cat > "$probe" <<'PROBE'
+{ "log": { "loglevel": "warning" },
+  "reverse": { "portals": [ { "tag": "p", "domain": "t.internal" } ] },
+  "inbounds": [ { "tag": "i", "listen": "127.0.0.1", "port": 65533, "protocol": "vless",
+    "settings": { "clients": [ { "id": "11111111-1111-1111-1111-111111111111" } ], "decryption": "none" },
+    "streamSettings": { "network": "xhttp", "xhttpSettings": { "path": "/p", "mode": "auto" } } } ],
+  "outbounds": [ { "protocol": "freedom" } ],
+  "routing": { "rules": [ { "type": "field", "inboundTag": [ "i" ], "outboundTag": "p" } ] } }
+PROBE
+      if "$XRAY_BIN" -test -config "$probe" >/dev/null 2>&1; then
+        ok "版本支持 Reverse + XHTTP"
+        rm -f "$probe"
+        return 0
+      fi
+      rm -f "$probe"
+      warn "当前 Xray 不支持 Reverse 或 XHTTP，需升级"
+      read -rp "升级到最新版？（会覆盖 $XRAY_BIN，现有配置不动）[y/N]: " yn
+      [ "$yn" = y ] || [ "$yn" = Y ] || die "已取消。请先自行升级 Xray-core 到支持 XHTTP+Reverse 的版本"
+    fi
+  fi
+
   info "安装 Xray-core ..."
-  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1 \
-    || die "Xray 安装失败"
-  [ -x "$XRAY_BIN" ] || die "Xray 安装后未找到 $XRAY_BIN"
+  local log; log=$(mktemp)
+  if ! bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install > "$log" 2>&1; then
+    echo "${RED}--- 官方安装脚本输出（末尾 15 行）---${RST}"
+    tail -15 "$log"
+    echo "${RED}------------------------------------${RST}"
+    echo "常见原因："
+    echo "  • GitHub 不可达 —— 试：curl -I https://github.com"
+    echo "  • 缺 unzip —— 试：apt install unzip 或 yum install unzip"
+    echo "  • 硬盘满 —— 试：df -h"
+    rm -f "$log"
+    die "Xray 安装失败（上方是真实错误）"
+  fi
+  rm -f "$log"
+  XRAY_BIN="/usr/local/bin/xray"
+  [ -x "$XRAY_BIN" ] || die "安装后未找到 $XRAY_BIN"
   ok "Xray 安装完成: $("$XRAY_BIN" version | head -1)"
 }
 
@@ -127,11 +181,25 @@ open_fw(){
 deploy_a(){
   need_root; install_deps; install_xray
 
+  local uport="${ATT_PORT:-443}"
+  case "$uport" in (*[!0-9]*) die "ATT_PORT 必须是数字";; esac
+
   local aip; aip=$(pubip); [ -n "$aip" ] || die "无法获取本机公网 IP"
   info "本机公网 IP: $aip（B 端将直连此 IP，A 的 IP 不要变）"
+  [ "$uport" = 443 ] || warn "使用非默认入口端口: $uport"
 
-  if ss -ltn 2>/dev/null | grep -q ':443 '; then
-    die "443 已被占用，请先处理：ss -ltnp | grep :443"
+  if ss -ltn 2>/dev/null | grep -q ":$uport "; then
+    echo
+    echo "${RED}$uport 已被占用。${RST}当前占用进程："
+    ss -ltnp 2>/dev/null | grep ":$uport " | sed 's/^/    /'
+    echo
+    echo "你有三个选择："
+    echo "  1) 先停掉占用 443 的服务（如已有 xray / nginx / 3x-ui）再重跑"
+    echo "  2) 换个入口端口：${CYN}ATT_PORT=8443 bash install.sh --server-a${RST}"
+    echo "     （非 443 可能更容易被识别，但能用）"
+    echo "  3) 换一台干净的机器做 A 端"
+    echo
+    die "已停止，没有动你现有服务"
   fi
 
   info "挑选可用 REALITY 回落域名 ..."
@@ -161,7 +229,7 @@ deploy_a(){
     {
       "tag": "user-in",
       "listen": "0.0.0.0",
-      "port": 443,
+      "port": $uport,
       "protocol": "vless",
       "settings": {
         "clients": [ { "id": "$uuid", "email": "node1" } ],
@@ -207,13 +275,14 @@ EOF
   apply_cfg "$tmp"
   harden_service
   tune_tcp
-  open_fw 443
+  open_fw "$uport"
   open_fw "$rport"
 
   mkdir -p "$STATE"
   cat > "$STATE/a.env" <<EOF
 ROLE=A
 A_IP=$aip
+USER_PORT=$uport
 REVERSE_PORT=$rport
 SNI=$sni
 SHORT_ID=$sid
@@ -331,12 +400,13 @@ show_links(){
   source "$STATE/a.env"
   echo "${BLD}--- 客户端分享链接 ---${RST}"
   local epath; epath=$(printf '%s' "$XPATH" | sed 's|/|%2F|g')
+  local uport="${USER_PORT:-443}"
   local n uuid
   while read -r n uuid; do
     [ -z "$n" ] && continue
     echo
     echo "${CYN}[$n]${RST}"
-    echo "vless://$uuid@$A_IP:443?encryption=none&security=reality&type=xhttp&path=$epath&mode=auto&sni=$SNI&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID#$n"
+    echo "vless://$uuid@$A_IP:$uport?encryption=none&security=reality&type=xhttp&path=$epath&mode=auto&sni=$SNI&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID#$n"
   done < <("$XRAY_BIN" -test -config "$CFG" >/dev/null 2>&1 && python3 - <<'PY'
 import json,sys
 d=json.load(open('/usr/local/etc/xray/config.json'))
@@ -385,8 +455,8 @@ selfcheck(){
 
   if [ -f "$STATE/a.env" ]; then
     source "$STATE/a.env"
-    echo "角色: ${BLD}A（入口端）${RST}   本机 IP: $A_IP   反代端口: $REVERSE_PORT"
-    ss -ltn 2>/dev/null | grep -q ':443 ' && ok "443 监听中" || echo "${RED}[X]${RST} 443 未监听"
+    echo "角色: ${BLD}A（入口端）${RST}   本机 IP: $A_IP   入口端口: ${USER_PORT:-443}   反代端口: $REVERSE_PORT"
+    ss -ltn 2>/dev/null | grep -q ":${USER_PORT:-443} " && ok "入口端口 ${USER_PORT:-443} 监听中" || echo "${RED}[X]${RST} 入口端口 ${USER_PORT:-443} 未监听"
     ss -ltn 2>/dev/null | grep -q ":$REVERSE_PORT " && ok "反代口 $REVERSE_PORT 监听中" || echo "${RED}[X]${RST} 反代口未监听"
     if ss -tn state established 2>/dev/null | grep -q ":$REVERSE_PORT"; then
       ok "B 的反向隧道已连上"

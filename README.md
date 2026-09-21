@@ -39,6 +39,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-tunnel/main/in
 
 要求：443 未被占用、公网 IP 固定（不绑域名的代价就是 A 的 IP 不能变）。
 
+**443 已被占用？**（机器上已有 xray / nginx / 3x-ui）脚本会列出占用进程并停下，不动你现有服务。两个办法：
+
+```bash
+# 办法一：换个入口端口
+ATT_PORT=8443 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-tunnel/main/install.sh) --server-a
+
+# 办法二：先停掉占 443 的服务再重跑
+```
+
+**已装过 Xray？** 脚本会直接复用（不重装），并自动探测版本是否支持 Reverse + XHTTP；不支持才询问你是否升级。除 `/usr/local/bin/xray` 外，也会自动在 `/usr/bin`、3x-ui、宝塔等常见路径查找。
+
 ### 2. 服务器 B（AT&T 出口机）
 
 把 A 输出的那行原样粘过去执行：
@@ -83,6 +94,8 @@ A 端菜单 `3` 看分享链接，任意支持 VLESS + REALITY + XHTTP 的客户
 
 5. **B 换 IP 后 A 侧会留一条僵死隧道**，portal 仍往里派流量，导致约 1/4 请求挂死。`tcpUserTimeout` 对 accept 出来的连接不生效；真正有效的是内核 `tcp_retries2`（默认 15 ≈ 15 分钟）。脚本设为 5（≈20 秒）。实测：调之前 6/8，调之后 10/10。
 
+6. **已装 Xray 的机器上原本会误报「安装 Xray 失败」**。原因有两层：安装输出被丢进 `/dev/null` 所以真实错误不可见；以及已有 xray 占着 443 时报错没说清怎么办。现在改为复用已有 xray + 打印官方脚本真实错误 + 列出 443 占用进程并给出解决办法。
+
 ## 已验证
 
 在两台全新 Debian 12 容器上从零部署，Xray 26.3.27：
@@ -94,6 +107,9 @@ A 端菜单 `3` 看分享链接，任意支持 VLESS + REALITY + XHTTP 的客户
 - 加节点后原节点不受影响（6/6）
 - A 重启后 B 30 秒内自动重拨恢复
 - B 换 IP 后自动重连（8/10，前 2 次是重拨窗口）
+- 已装 Xray 的机器：复用现有 xray、正确探测 Reverse+XHTTP 支持、443 被占时给出可操作提示
+- `ATT_PORT=8443` 自定义入口端口：端到端 10/10，分享链接与自检均正确显示 8443
+- 默认 443 路径回归测试 10/10（无退化）
 
 **未验证**：真实 AT&T 线路上的丢包改善幅度（需要实际 AT&T 出口机）；不同云厂商安全组需自行放行 443 与反代端口。
 
