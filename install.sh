@@ -98,8 +98,21 @@ PROBE
 }
 
 # ---------- 回落域名：实测可用才用（文档坑：microsoft 在新版会握手失败） ----------
-CANDIDATES=(www.apple.com www.cloudflare.com www.icloud.com dl.google.com www.bing.com)
+# 与 NodeLite 保持一致的预置列表（NodeLite 默认 www.atlasobscura.com）。
+# 已逐个做过真实 REALITY 握手实测（Xray 26.3.27），
+# NodeLite 预置中的 www.hkstp.org 实测不通，故不纳入。
+CANDIDATES=(www.atlasobscura.com www.backblaze.com www.gog.com www.cern.ch \
+            www.sciencemuseum.org.uk www.visitsingapore.com www.discoverhongkong.com \
+            www.a-star.edu.sg www.animatetimes.com www.famitsu.com www.jodrellbank.net)
 pick_sni(){
+  # 手动指定优先：ATT_SNI=www.example.com
+  if [ -n "${ATT_SNI:-}" ]; then
+    if timeout 8 openssl s_client -connect "$ATT_SNI:443" -tls1_3 -servername "$ATT_SNI" </dev/null 2>/dev/null \
+       | grep -q 'TLSv1.3'; then
+      echo "$ATT_SNI"; return 0
+    fi
+    warn "指定的 $ATT_SNI 不支持 TLS 1.3，改用预置列表" >&2
+  fi
   local d
   for d in "${CANDIDATES[@]}"; do
     if timeout 8 openssl s_client -connect "$d:443" -tls1_3 -servername "$d" </dev/null 2>/dev/null \

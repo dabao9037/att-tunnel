@@ -50,6 +50,14 @@ ATT_PORT=8443 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-
 
 **已装过 Xray？** 脚本会直接复用（不重装），并自动探测版本是否支持 Reverse + XHTTP；不支持才询问你是否升级。除 `/usr/local/bin/xray` 外，也会自动在 `/usr/bin`、3x-ui、宝塔等常见路径查找。
 
+**伪装域名（SNI）** 默认用 `www.atlasobscura.com`，与 NodeLite 保持一致。预置列表也和 NodeLite 同步，部署时会自动挑选当下真实可用的一个。想指定其他域名：
+
+```bash
+ATT_SNI=www.gog.com bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-tunnel/main/install.sh) --server-a
+```
+
+（指定的域名不支持 TLS 1.3 时会告警并自动回退到预置列表）
+
 ### 2. 服务器 B（AT&T 出口机）
 
 把 A 输出的那行原样粘过去执行：
@@ -84,7 +92,9 @@ A 端菜单 `3` 看分享链接，任意支持 VLESS + REALITY + XHTTP 的客户
 
 这些都是实测踩出来的，不是照抄文档：
 
-1. **`www.microsoft.com` 作 REALITY 回落域名会握手失败**（Xray 26.3.27 实测：AuthKey 双方匹配，但 TLS 在 Certificate 阶段中断）。脚本改为从 apple / cloudflare / icloud / dl.google / bing 里**实测挑选**可用的。
+1. **`www.microsoft.com` 作 REALITY 回落域名会握手失败**（Xray 26.3.27 实测：AuthKey 双方匹配，但 TLS 在 Certificate 阶段中断）。现在预置列表与 NodeLite 保持一致，并在部署时**实测挑选**。
+
+   顺便对 NodeLite 的 12 个预置域名逐个做了真实 REALITY 握手测试，**11 个通过，`www.hkstp.org` 不通**（它 TLS 1.3 正常，但 REALITY 握手失败），故本脚本不纳入。
 
 2. **A 侧不能手写 `portal` 出站**。reverse 组件会自己注册 handler，手写会报 `"vnext" should have one and only one member`。
 
@@ -110,6 +120,7 @@ A 端菜单 `3` 看分享链接，任意支持 VLESS + REALITY + XHTTP 的客户
 - 已装 Xray 的机器：复用现有 xray、正确探测 Reverse+XHTTP 支持、443 被占时给出可操作提示
 - `ATT_PORT=8443` 自定义入口端口：端到端 10/10，分享链接与自检均正确显示 8443
 - 默认 443 路径回归测试 10/10（无退化）
+- SNI 换为 NodeLite 的 `www.atlasobscura.com` 后端到端 12/12；`ATT_SNI` 手动指定与无效域名自动回退均正常
 
 **未验证**：真实 AT&T 线路上的丢包改善幅度（需要实际 AT&T 出口机）；不同云厂商安全组需自行放行 443 与反代端口。
 
