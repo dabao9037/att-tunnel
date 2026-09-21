@@ -3,7 +3,7 @@
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -12,6 +12,9 @@ SVC="att-tunnel"
 STATE="/etc/att-tunnel"
 TUNNEL_DOMAIN="tunnel.internal"
 REVERSE_STYLE="new"   # 由 install_xray 实测覆盖：new=VLESS Reverse Proxy / old=顶层 reverse
+# 固定 Xray 版本：26.7 及以后的版本有 bug，钉在 2026 年 6 月最后一版。
+# 需要时可用 ATT_XRAY_VER 覆盖（例：ATT_XRAY_VER=v26.6.22）。
+XRAY_VER="${ATT_XRAY_VER:-v26.6.27}"
 
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYN=$'\033[36m'; BLD=$'\033[1m'; RST=$'\033[0m'
 info(){ echo "${CYN}==>${RST} $*"; }
@@ -111,7 +114,7 @@ PROBE
     fi
   fi
 
-  info "安装专用 Xray-core 到 /usr/local/bin/xray ..."
+  info "安装专用 Xray-core $XRAY_VER 到 /usr/local/bin/xray ..."
   # 不用官方安装脚本：它会 stop/接管 xray.service，在已有面板的机器上会出问题，
   # 而且可能装比现有版本更旧的版。直接拉 latest 二进制。
   local arch tmpd
@@ -122,7 +125,7 @@ PROBE
     *) die "不支持的架构：$(uname -m)" ;;
   esac
   tmpd=$(mktemp -d)
-  local url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$arch.zip"
+  local url="https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-$arch.zip"
   if ! curl -fsSL --max-time 180 -o "$tmpd/x.zip" "$url"; then
     rm -rf "$tmpd"
     echo "下载失败：$url"

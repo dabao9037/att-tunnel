@@ -47,6 +47,12 @@ ATT_PORT=8443 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-
 
 注意：非 443 的 REALITY 伪装效果会打折（Xray 自己也会告警）。能腾出 443 就腾。
 
+**Xray 版本钉在 v26.6.27**（26.7 及以后的版本有 bug）。需要换版本：
+
+```bash
+ATT_XRAY_VER=v26.6.22 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-tunnel/main/install.sh) --server-a
+```
+
 **与现有节点完全隔离。** 本工具用独立配置 `/usr/local/etc/att-tunnel/config.json` 和独立服务 `att-tunnel.service`，**不覆盖 `/usr/local/etc/xray/config.json`，也不重启你的 `xray.service`**。机器上已有 3x-ui / NodeLite / 手动节点都能并存。卸载也只动自己的东西。
 
 **已装过 Xray？** 脚本会直接复用（不重装），并自动探测版本是否支持 Reverse + XHTTP；不支持才询问你是否升级。除 `/usr/local/bin/xray` 外，也会自动在 `/usr/bin`、3x-ui、宝塔等常见路径查找。
