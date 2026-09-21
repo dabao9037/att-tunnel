@@ -356,9 +356,7 @@ deploy_a(){
   # 坑：flow 必须两端完全一致。服务端有 Vision 而客户端没填 flow 时，
   # Xray 直接拒绝（日志：rejected since the client flow is empty），
   # 客户端表现为 EOF / 502。很多客户端导入链接时会丢掉 flow 参数。
-  # 所以 raw 模式同时建两个用户（不同 UUID）：
-  #   node1        带 Vision —— 抗封更好，优先用
-  #   node1-compat 不带 flow —— 客户端不支持 Vision 时的保底
+  # 客户端导入分享链接后必须保留 flow 字段。
   local a_clients a_users
   if [ "$ATT_TRANSPORT" = xhttp ]; then
     a_clients="{ \"id\": \"$uuid\", \"email\": \"node1\" }"
