@@ -3,7 +3,7 @@
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
 set -euo pipefail
 
-VERSION="1.10.0"
+VERSION="2.0.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -377,14 +377,16 @@ deploy_a(){
   fi
 
   local a_reverse_blk a_bclient a_extra_rule
+  # 1:1：首个节点 node1 的专属 portal 标签叫 portal-node1；
+  # 后续每加一个节点就多一个 bridge client + 一个 portal-<name>。
   if [ "$REVERSE_STYLE" = new ]; then
     a_reverse_blk=""
-    a_bclient="{ \"id\": \"$buuid\", \"reverse\": { \"tag\": \"portal\" } }"
+    a_bclient="{ \"id\": \"$buuid\", \"reverse\": { \"tag\": \"portal-node1\" } }"
     a_extra_rule=""
   else
-    a_reverse_blk="  \"reverse\": { \"portals\": [ { \"tag\": \"portal\", \"domain\": \"$TUNNEL_DOMAIN\" } ] },"
+    a_reverse_blk="  \"reverse\": { \"portals\": [ { \"tag\": \"portal-node1\", \"domain\": \"$TUNNEL_DOMAIN\" } ] },"
     a_bclient="{ \"id\": \"$buuid\" }"
-    a_extra_rule="      { \"type\": \"field\", \"inboundTag\": [ \"reverse-in\" ], \"domain\": [ \"full:$TUNNEL_DOMAIN\" ], \"outboundTag\": \"portal\" },"
+    a_extra_rule="      { \"type\": \"field\", \"inboundTag\": [ \"reverse-in\" ], \"domain\": [ \"full:$TUNNEL_DOMAIN\" ], \"outboundTag\": \"portal-node1\" },"
   fi
 
   local tmp; tmp=$(mktemp --suffix=.json)
@@ -432,7 +434,7 @@ $a_reverse_blk
   "routing": {
     "rules": [
 $a_extra_rule
-      { "type": "field", "user": [ $a_users ], "outboundTag": "portal" }
+      { "type": "field", "user": [ $a_users ], "outboundTag": "portal-node1" }
     ]
   }
 }
@@ -641,10 +643,183 @@ EOF
   ok "B 端无任何入站监听，公网扫不到"
   ok "B 换 IP 无需任何操作，Xray 会自动重拨"
   echo
-  warn "如需把 SSH 迁到高位端口（降低暴露面），单独跑：菜单 7"
+  warn "如需把 SSH 迁到高位端口（降低暴露面），单独跑：菜单 9"
 }
 
-# ================= 节点管理 =================
+# ================= 节点 / 出口机 管理 =================
+# 架构：一个节点 = 一台出口机 = 一个 portal 标签（严格 1:1）
+#   A 端 reverse-in 挂多个 bridge client，每个带自己的 reverse.tag
+#   路由一节点一条规则：user:[nodeX] -> portal-nodeX
+# B 端无需任何改动：它只认 token 里的 uuid，一台 B 一个 uuid 天然分开，
+# 多台 B 复用同一个反代端口没问题。
+
+# 输出：节点名 <TAB> portal标签 <TAB> 出口uuid（一行一个节点）
+# portal 标签或 uuid 为空 = 该节点没有绑定出口机
+list_exits(){
+  [ -f "$CFG" ] || return 1
+  ATT_CFG="$CFG" python3 - <<'PY'
+import json,os,sys
+try:
+    d=json.load(open(os.environ['ATT_CFG']))
+except Exception:
+    sys.exit(1)
+bridges={}
+for ib in d.get('inbounds',[]):
+    if ib.get('tag')=='reverse-in':
+        for c in ib.get('settings',{}).get('clients',[]):
+            t=(c.get('reverse') or {}).get('tag')
+            if t:
+                bridges[t]=c.get('id','')
+node2portal={}
+for r in d.get('routing',{}).get('rules',[]):
+    ot=r.get('outboundTag','')
+    if ot.startswith('portal'):
+        for u in r.get('user',[]):
+            node2portal[u]=ot
+for ib in d.get('inbounds',[]):
+    if ib.get('tag')=='user-in':
+        for c in ib.get('settings',{}).get('clients',[]):
+            n=c.get('email','node')
+            p=node2portal.get(n,'')
+            print('%s\t%s\t%s'%(n,p,bridges.get(p,'')))
+PY
+}
+
+# 只列节点名
+list_nodes(){ list_exits | cut -f1; }
+
+# xray -test 查不出来的错配，必须自己拦。以下三种实测（Xray 26.6.27）
+# 全部返回 Configuration OK，Xray 一个都不管：
+#   1) 节点没有 portal 规则 -> 流量 fallthrough 到 direct，从 A 出网，泄露 A 的 IP
+#   2) portal 标签重复     -> Xray 在多条隧道间随机派流，出口 IP 不确定
+#   3) 规则指向不存在的标签 -> 静默失效
+validate_cfg(){
+  local f="${1:-$CFG}"
+  ATT_CFG="$f" python3 - <<'PY'
+import json,os,sys
+err=[]
+try:
+    d=json.load(open(os.environ['ATT_CFG']))
+except Exception as e:
+    print('配置不是合法 JSON: %s'%e); sys.exit(1)
+
+bridge_tags=[]
+for ib in d.get('inbounds',[]):
+    if ib.get('tag')=='reverse-in':
+        for c in ib.get('settings',{}).get('clients',[]):
+            t=(c.get('reverse') or {}).get('tag')
+            if t:
+                bridge_tags.append(t)
+dup=sorted({t for t in bridge_tags if bridge_tags.count(t)>1})
+for t in dup:
+    err.append('portal 标签重复: %s（流量会在多条隧道间随机派发）'%t)
+
+nodes=[]
+for ib in d.get('inbounds',[]):
+    if ib.get('tag')=='user-in':
+        for c in ib.get('settings',{}).get('clients',[]):
+            nodes.append(c.get('email','node'))
+
+node2portal={}
+for r in d.get('routing',{}).get('rules',[]):
+    ot=r.get('outboundTag','')
+    if not ot.startswith('portal'):
+        continue
+    if ot not in bridge_tags:
+        err.append('路由指向不存在的 portal 标签: %s'%ot)
+    for u in r.get('user',[]):
+        if u not in nodes:
+            err.append('路由里有悬空用户: %s（入站里没这个节点）'%u)
+        node2portal[u]=ot
+
+for n in nodes:
+    if n not in node2portal:
+        err.append('节点 %s 没绑定出口机（流量会从 A 直接出网，泄露 A 的 IP）'%n)
+
+if err:
+    for e in err:
+        print(e)
+    sys.exit(1)
+PY
+}
+
+# 旧版（1.x）只有一个叫 "portal" 的标签，所有节点共享它。
+# 升级做法：标签 portal -> portal-<首个节点名>，bridge uuid 不变，
+# 所以 B 端不用重新部署，老 token 和客户端链接全部继续有效。
+needs_migrate(){
+  [ -f "$CFG" ] || return 1
+  grep -q '"tag": "portal"' "$CFG" 2>/dev/null
+}
+
+migrate_cfg(){
+  need_root
+  [ -f "$STATE/a.env" ] || die "只有 A 端需要升级配置"
+  needs_migrate || { ok "配置已是多出口结构，无需升级"; return 0; }
+
+  info "检测到旧的单 portal 配置，升级为多出口结构 ..."
+  local tmp; tmp=$(mktemp --suffix=.json)
+  local rc=0
+  ATT_CFG="$CFG" python3 - > "$tmp" <<'PY' || rc=$?
+import json,os,sys
+d=json.load(open(os.environ['ATT_CFG']))
+first=None
+for ib in d.get('inbounds',[]):
+    if ib.get('tag')=='user-in':
+        cs=ib.get('settings',{}).get('clients',[])
+        if cs:
+            first=cs[0].get('email','node1')
+        break
+if not first:
+    raise SystemExit('NONODE')
+new='portal-%s'%first
+hit=False
+for ib in d.get('inbounds',[]):
+    if ib.get('tag')=='reverse-in':
+        for c in ib.get('settings',{}).get('clients',[]):
+            rv=c.get('reverse') or {}
+            if rv.get('tag')=='portal':
+                rv['tag']=new; c['reverse']=rv; hit=True
+for r in d.get('routing',{}).get('rules',[]):
+    if r.get('outboundTag')=='portal':
+        r['outboundTag']=new; hit=True
+if not hit:
+    raise SystemExit('NOTHING')
+sys.stderr.write(new+'\n')
+print(json.dumps(d,indent=1))
+PY
+  if [ "$rc" != 0 ] || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"; die "升级失败：配置解析异常（原配置未改动）"
+  fi
+  local vmsg
+  if ! vmsg=$(validate_cfg "$tmp"); then
+    rm -f "$tmp"
+    echo "$vmsg" | sed 's/^/    /'
+    die "升级后配置自检不通过（原配置未改动）"
+  fi
+  apply_cfg "$tmp"
+  ok "配置已升级为多出口结构"
+  ok "B 端无需重新部署，客户端链接也不变（bridge uuid 未变）"
+  local shared; shared=$(list_exits | awk -F'\t' '{print $2}' | sort | uniq -d)
+  if [ -n "$shared" ]; then
+    echo
+    warn "以下出口被多个节点共用（遗留的旧结构，不是 1:1）："
+    local p
+    while read -r p; do
+      [ -z "$p" ] && continue
+      echo "    $p <- $(list_exits | awk -F'\t' -v t="$p" '$2==t{printf "%s ", $1}')"
+    done <<< "$shared"
+    warn "这些节点出口 IP 相同。想让它们各走自己的出口机："
+    warn "  先删掉多余的（菜单 7），再用菜单 5 每个重新加一台出口机"
+  fi
+}
+
+# A 端所有改动入口先跑一下，避免在旧结构上叠新出口
+ensure_migrated(){
+  needs_migrate || return 0
+  warn "当前是旧的单出口配置，先自动升级"
+  migrate_cfg
+}
+
 show_links(){
   [ -f "$STATE/a.env" ] || { warn "本机不是 A 端，或尚未部署"; return 1; }
   # shellcheck disable=SC1090
@@ -653,6 +828,7 @@ show_links(){
   local epath; epath=$(printf '%s' "$XPATH" | sed 's|/|%2F|g')
   local tr="${TRANSPORT:-xhttp}"
   local uport="${USER_PORT:-443}"
+  local rows; rows=$(list_exits 2>/dev/null || true)
   local n uuid fl qs
   # flow 由每个用户自己的配置决定，不能一刀切
   while read -r n uuid fl; do
@@ -664,8 +840,16 @@ show_links(){
     else
       qs="type=tcp"
     fi
+    # 每个节点标注它的专属出口（1:1）
+    local ptag tip=""
+    ptag=$(printf '%s\n' "$rows" | awk -F'\t' -v k="$n" '$1==k{print $2}')
+    if [ -z "$ptag" ]; then
+      tip="  ${RED}未绑定出口机（流量会从 A 出网，泄露 A 的 IP）${RST}"
+    else
+      tip="  出口：${CYN}$ptag${RST}"
+    fi
     echo
-    echo "${CYN}[$n]${RST}"
+    echo "${CYN}[$n]${RST}$tip"
     echo "vless://$uuid@$A_IP:$uport?encryption=none&security=reality&$qs&sni=$SNI&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID#$n"
   done < <("$XRAY_BIN" -test -config "$CFG" >/dev/null 2>&1 && ATT_CFG="$CFG" python3 - <<'PY'
 import json,os
@@ -677,29 +861,59 @@ for ib in d['inbounds']:
 PY
 )
   echo
+  echo "${BLD}一个节点 = 一台出口机${RST}（严格 1:1）。拿某节点的出口机部署命令：菜单 6"
+  echo "隧道是否全部连上：菜单 8（自检）。A 侧无法把单条连接对到具体节点，只能看总数。"
   if [ "$tr" != xhttp ]; then
     echo "${BLD}客户端必须带上 ${GRN}flow=xtls-rprx-vision${RST}${BLD}（导入后请核对）${RST}"
     echo "若报 EOF / 502，几乎肯定是客户端丢了 flow 参数。"
   fi
 }
 
+# 打印某台出口机的部署命令（token 含隧道密钥）
+print_b_cmd(){
+  local buuid="$1" name="${2:-}"
+  # shellcheck disable=SC1090
+  source "$STATE/a.env"
+  local token
+  token=$(printf '%s|%s|%s|%s|%s' "$A_IP" "$REVERSE_PORT" "$buuid" "${VLESS_ENC:-none}" "${REVERSE_STYLE:-new}" | base64 -w0)
+  echo
+  echo "${BLD}到这个节点的出口机${name:+（$name）}上执行：${RST}"
+  echo
+  echo "${GRN}bash <(curl -fsSL $RAW_URL) --bridge $token${RST}"
+  echo
+  echo "${YEL}这串 token 含隧道密钥，只在你自己两台机器间使用，不要外发。${RST}"
+}
+
 add_node(){
   need_root
   [ -f "$STATE/a.env" ] || die "只能在 A 端加节点"
+  ensure_migrated
   local name="${1:-}"
   [ -n "$name" ] || { read -rp "节点名称（如 node2）: " name; }
   [ -n "$name" ] || die "名称不能为空"
-  local uuid; uuid=$("$XRAY_BIN" uuid)
+  # 节点名会拼进 portal 标签和分享链接，限制字符集
+  printf '%s' "$name" | grep -qE '^[A-Za-z0-9_-]{1,32}$' \
+    || die "名称只能用字母/数字/下划线/连字符，最多 32 位"
+
+  local uuid buuid
+  uuid=$("$XRAY_BIN" uuid)    # 客户端用
+  buuid=$("$XRAY_BIN" uuid)   # 这个节点专属出口机用
+
   local tmp; tmp=$(mktemp --suffix=.json)
-  NEW_NAME="$name" NEW_UUID="$uuid" ATT_CFG="$CFG" python3 - > "$tmp" <<'PY'
+  local rc=0
+  NEW_NAME="$name" NEW_UUID="$uuid" NEW_BUUID="$buuid" ATT_CFG="$CFG" python3 - > "$tmp" <<'PY' || rc=$?
 import json,os
 d=json.load(open(os.environ['ATT_CFG']))
-name=os.environ['NEW_NAME']; uuid=os.environ['NEW_UUID']
+name=os.environ['NEW_NAME']
+uuid=os.environ['NEW_UUID']; buuid=os.environ['NEW_BUUID']
+ptag='portal-%s'%name
+
 # raw 模式必带 Vision（抗封）；xhttp 不支持 flow
 vision=False
 for ib in d['inbounds']:
     if ib.get('tag')=='user-in' and ib['streamSettings'].get('network')=='raw':
         vision=True
+
 for ib in d['inbounds']:
     if ib.get('tag')=='user-in':
         cs=ib['settings']['clients']
@@ -709,48 +923,116 @@ for ib in d['inbounds']:
         if vision:
             c['flow']='xtls-rprx-vision'
         cs.append(c)
-for r in d['routing']['rules']:
-    if 'user' in r and name not in r['user']:
-        r['user'].append(name)
+
+# 严格 1:1：这个节点自己的 bridge client + 自己的 portal 标签
+for ib in d['inbounds']:
+    if ib.get('tag')=='reverse-in':
+        bs=ib['settings']['clients']
+        if any((b.get('reverse') or {}).get('tag')==ptag for b in bs):
+            raise SystemExit('DUPTAG')
+        bs.append({'id':buuid,'reverse':{'tag':ptag}})
+
+# 一节点一条路由，不往旧规则里追加
+d.setdefault('routing',{}).setdefault('rules',[]).append(
+    {'type':'field','user':[name],'outboundTag':ptag})
 print(json.dumps(d,indent=1))
 PY
-  [ -s "$tmp" ] || die "节点名已存在或配置解析失败"
+  if [ "$rc" != 0 ] || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"
+    die "节点名已存在或配置解析失败（原配置未改动）"
+  fi
+  local vmsg
+  if ! vmsg=$(validate_cfg "$tmp"); then
+    rm -f "$tmp"; echo "$vmsg" | sed 's/^/    /'
+    die "配置自检不通过（原配置未改动）"
+  fi
+
   apply_cfg "$tmp"
-  ok "节点 $name 已添加"
+  open_fw "$REVERSE_PORT" 2>/dev/null || true
+  ok "节点 $name 已添加（专属出口 portal-$name）"
+  warn "这个节点现在还没有出口机，隧道未建立前不可用"
+  print_b_cmd "$buuid" "$name"
+  echo
+  info "出口机部署完后，跑菜单 8（自检）确认隧道已连"
   show_links
 }
 
-# 列出 user-in 里现有的节点名（一行一个）
-list_nodes(){
-  [ -f "$CFG" ] || return 1
-  ATT_CFG="$CFG" python3 - <<'PY'
-import json,os,sys
-try:
-    d=json.load(open(os.environ['ATT_CFG']))
-except Exception:
-    sys.exit(1)
-for ib in d.get('inbounds',[]):
-    if ib.get('tag')=='user-in':
-        for c in ib.get('settings',{}).get('clients',[]):
-            print(c.get('email','node'))
-PY
+# 节点 / 出口机 对应表
+show_exits(){
+  [ -f "$STATE/a.env" ] || { warn "本机不是 A 端，或尚未部署"; return 1; }
+  local rows; rows=$(list_exits) || die "读不到配置 $CFG"
+  [ -n "$rows" ] || { warn "配置里没有任何节点"; return 1; }
+  echo "${BLD}--- 节点 / 出口机（严格 1:1）---${RST}"
+  local i=0 n p u
+  while IFS=$'\t' read -r n p u; do
+    [ -z "$n" ] && continue
+    i=$((i+1))
+    if [ -z "$p" ]; then
+      echo "  $i) $n  ${RED}未绑定出口机${RST}"
+    else
+      echo "  $i) $n  →  $p"
+    fi
+  done <<< "$rows"
+  echo
+  local shared; shared=$(printf '%s\n' "$rows" | awk -F'\t' '$2!=""{print $2}' | sort | uniq -d)
+  if [ -n "$shared" ]; then
+    warn "有出口被多个节点共用，这些节点出口 IP 相同（不是 1:1）："
+    local p2
+    while read -r p2; do
+      [ -z "$p2" ] && continue
+      echo "    $p2 <- $(printf '%s\n' "$rows" | awk -F'\t' -v t="$p2" '$2==t{printf "%s ", $1}')"
+    done <<< "$shared"
+  fi
+  info "拿某节点的出口机部署命令：菜单 6；隧道连接情况：菜单 8（自检）"
+}
+
+# 重新拿某个节点的出口机部署命令（换机、重装时用）
+show_exit_cmd(){
+  [ -f "$STATE/a.env" ] || die "只能在 A 端查"
+  local rows; rows=$(list_exits) || die "读不到配置 $CFG"
+  [ -n "$rows" ] || die "配置里没有任何节点"
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    echo "${BLD}--- 节点 / 出口机 ---${RST}"
+    local i=0 n p u
+    while IFS=$'\t' read -r n p u; do
+      [ -z "$n" ] && continue
+      i=$((i+1))
+      echo "  $i) $n  ${p:-${RED}未绑定${RST}}"
+    done <<< "$rows"
+    echo
+    read -rp "查哪个节点的出口机命令？（名称或序号，回车取消）: " name
+    [ -n "$name" ] || { warn "已取消"; return; }
+  fi
+  if printf '%s' "$name" | grep -qE '^[0-9]+$'; then
+    name=$(printf '%s\n' "$rows" | sed -n "${name}p" | cut -f1)
+    [ -n "$name" ] || die "序号超出范围"
+  fi
+  local line; line=$(printf '%s\n' "$rows" | awk -F'\t' -v n="$name" '$1==n')
+  [ -n "$line" ] || die "节点 $name 不存在"
+  local buuid; buuid=$(printf '%s' "$line" | cut -f3)
+  [ -n "$buuid" ] || die "节点 $name 没有绑定出口机（配置异常，跑菜单 8 自检）"
+  print_b_cmd "$buuid" "$name"
 }
 
 del_node(){
   need_root
   [ -f "$STATE/a.env" ] || die "只能在 A 端删节点"
-  local names; names=$(list_nodes) || die "读不到配置 $CFG"
-  [ -n "$names" ] || die "配置里没有任何节点"
+  ensure_migrated
+  local rows; rows=$(list_exits) || die "读不到配置 $CFG"
+  [ -n "$rows" ] || die "配置里没有任何节点"
+  local names; names=$(printf '%s\n' "$rows" | cut -f1)
   local total; total=$(printf '%s\n' "$names" | grep -c .)
 
   local name="${1:-}"
   if [ -z "$name" ]; then
-    echo "${BLD}--- 当前节点 ---${RST}"
-    local i=0 n
-    while read -r n; do
+    echo "${BLD}--- 当前节点 / 出口机 ---${RST}"
+    local i=0 n p u
+    while IFS=$'\t' read -r n p u; do
       [ -z "$n" ] && continue
-      i=$((i+1)); echo "  $i) $n"
-    done <<< "$names"
+      i=$((i+1))
+      echo "  $i) $n  ${p:-${RED}未绑定${RST}}"
+    done <<< "$rows"
     echo
     read -rp "删除哪个节点？（输名称或序号，回车取消）: " name
     [ -n "$name" ] || { warn "已取消"; return; }
@@ -765,8 +1047,12 @@ del_node(){
 
   printf '%s\n' "$names" | grep -qxF "$name" || die "节点 $name 不存在"
   # 入站至少要留一个 client，否则 Xray 校验不过；真要清空请走卸载
-  [ "$total" -gt 1 ] || die "这是最后一个节点，删掉入口就没人能用了。要停用请用菜单 8（卸载）"
+  [ "$total" -gt 1 ] || die "这是最后一个节点，删掉入口就没人能用了。要停用请用菜单 10（卸载）"
 
+  local ptag; ptag=$(printf '%s\n' "$rows" | awk -F'\t' -v n="$name" '$1==n{print $2}')
+  echo
+  warn "将一并删除它的专属出口绑定${ptag:+（$ptag）}"
+  warn "对应的出口机会失去连接。它上面的 att-tunnel 需你自己去卸载（否则它会一直重试拨号）"
   read -rp "确认删除节点 ${BLD}$name${RST}？它的分享链接会立刻失效（输 yes）: " c
   [ "$c" = yes ] || { warn "已取消"; return; }
 
@@ -776,6 +1062,14 @@ del_node(){
 import json,os
 d=json.load(open(os.environ['ATT_CFG']))
 name=os.environ['DEL_NAME']
+
+# 这个节点绑的 portal 标签（从路由反查，比拼名字可靠）
+ptags=set()
+for r in d.get('routing',{}).get('rules',[]):
+    ot=r.get('outboundTag','')
+    if ot.startswith('portal') and name in r.get('user',[]):
+        ptags.add(ot)
+
 found=False
 for ib in d.get('inbounds',[]):
     if ib.get('tag')=='user-in':
@@ -788,20 +1082,48 @@ for ib in d.get('inbounds',[]):
         ib['settings']['clients']=keep
 if not found:
     raise SystemExit('NOTFOUND')
-# 同步摘掉 portal 路由里的这个用户，否则留下悬空引用
+
+# 1:1：摘掉它专属的 bridge client。仅当没有其他节点共用该标签时才删，
+# 防止旧结构（多节点共一个 portal）下误删别人的隧道。
+still={}
+for r in d.get('routing',{}).get('rules',[]):
+    ot=r.get('outboundTag','')
+    if ot.startswith('portal'):
+        others=[u for u in r.get('user',[]) if u!=name]
+        if others:
+            still[ot]=others
+drop={t for t in ptags if t not in still}
+if drop:
+    for ib in d.get('inbounds',[]):
+        if ib.get('tag')=='reverse-in':
+            ib['settings']['clients']=[
+                b for b in ib['settings']['clients']
+                if (b.get('reverse') or {}).get('tag') not in drop]
+
+# 同步摘掉 portal 路由里的这个用户，用空了的规则整条删掉
+rules=[]
 for r in d.get('routing',{}).get('rules',[]):
     if 'user' in r:
         r['user']=[u for u in r['user'] if u!=name]
+        if not r['user']:
+            continue
+    rules.append(r)
+d['routing']['rules']=rules
 print(json.dumps(d,indent=1))
 PY
   if [ "$rc" != 0 ] || [ ! -s "$tmp" ]; then
     rm -f "$tmp"
     die "删除失败：配置解析异常或节点已不存在（原配置未改动）"
   fi
+  local vmsg
+  if ! vmsg=$(validate_cfg "$tmp"); then
+    rm -f "$tmp"; echo "$vmsg" | sed 's/^/    /'
+    die "配置自检不通过（原配置未改动）"
+  fi
 
   # apply_cfg 会先 xray -test 校验，失败自动回滚
   apply_cfg "$tmp"
-  ok "节点 $name 已删除（已备份原配置到 $CFG.bak-*）"
+  ok "节点 $name 及其出口绑定已删除（已备份原配置到 $CFG.bak-*）"
   echo
   info "剩下的节点："
   show_links
@@ -825,22 +1147,59 @@ selfcheck(){
     echo "角色: ${BLD}A（入口端）${RST}   本机 IP: $A_IP   入口端口: ${USER_PORT:-443}   反代端口: $REVERSE_PORT"
     ss -ltn 2>/dev/null | grep -q ":${USER_PORT:-443} " && ok "入口端口 ${USER_PORT:-443} 监听中" || echo "${RED}[X]${RST} 入口端口 ${USER_PORT:-443} 未监听"
     ss -ltn 2>/dev/null | grep -q ":$REVERSE_PORT " && ok "反代口 $REVERSE_PORT 监听中" || echo "${RED}[X]${RST} 反代口未监听"
-    if ss -tn state established 2>/dev/null | grep -q ":$REVERSE_PORT"; then
-      ok "B 的反向隧道已连上"
-      ss -tn state established 2>/dev/null | grep ":$REVERSE_PORT" | head -3 | sed 's/^/    /'
-    else
-      warn "没有来自 B 的 ESTAB —— B 端未部署或端口被封"
+
+    # 节点 / 出口机 对应表（严格 1:1）
+    if needs_migrate; then
+      echo
+      warn "配置还是旧的单出口结构（所有节点共一台 B）"
+      warn "跑菜单 5 或 7 会自动升级，也可直接跑：$0 --migrate"
     fi
-    grep -q '"outboundTag": "portal"' "$CFG" && ok "portal 路由已配置" || warn "portal 路由缺失"
+    local rows nexit=0
+    rows=$(list_exits 2>/dev/null || true)
+    if [ -n "$rows" ]; then
+      echo
+      echo "${BLD}节点 / 出口机（1:1）${RST}"
+      local n p u
+      while IFS=$'\t' read -r n p u; do
+        [ -z "$n" ] && continue
+        if [ -z "$p" ]; then
+          echo "    $n  ${RED}未绑定出口机→流量从 A 出网，泄露 A 的 IP${RST}"
+        else
+          echo "    $n  →  $p"
+          nexit=$((nexit+1))
+        fi
+      done <<< "$rows"
+    fi
+
+    # 配置自检：xray -test 拦不住的错配（泄露 A IP / 标签重复 / 悬空引用）
+    local vmsg
+    if vmsg=$(validate_cfg "$CFG" 2>/dev/null); then
+      ok "节点与出口绑定自检通过"
+    else
+      echo "${RED}[X]${RST} 配置自检发现问题："
+      echo "$vmsg" | sed 's/^/    /'
+    fi
+
+    # 多出口下多条隧道是正常的，只有超出出口数才可疑（僵死连接）
     local ntun; ntun=$(ss -tn state established 2>/dev/null | grep -c ":$REVERSE_PORT")
-    if [ "$ntun" -gt 1 ]; then
-      warn "检测到 $ntun 条隧道连接 —— 可能有僵死连接（B 刚换过 IP）"
-      warn "部分请求会挂死，等 ~20s 内核回收；若长期如此查：sysctl net.ipv4.tcp_retries2（应为 5）"
+    if [ "$ntun" = 0 ]; then
+      warn "没有来自 B 的 ESTAB —— 出口机未部署或端口被封"
+    else
+      ok "反向隧道连接数：$ntun（已绑定出口：$nexit）"
+      ss -tn state established 2>/dev/null | grep ":$REVERSE_PORT" | head -5 | sed 's/^/    /'
+      if [ "$nexit" -gt 0 ] && [ "$ntun" -lt "$nexit" ]; then
+        warn "隧道数少于出口数 —— 有出口机没连上（未部署 / 安全组未放行 / 已关机）"
+      fi
+      if [ "$nexit" -gt 0 ] && [ "$ntun" -gt "$nexit" ]; then
+        warn "隧道数多于出口数 —— 可能有僵死连接（某台 B 刚换过 IP）"
+        warn "部分请求会挂死，等 ~20s 内核回收；若长期如此查：sysctl net.ipv4.tcp_retries2（应为 5）"
+      fi
     fi
     local r2; r2=$(sysctl -n net.ipv4.tcp_retries2 2>/dev/null)
     [ "$r2" = 5 ] && ok "tcp_retries2=5（僵死隧道快速回收）" || warn "tcp_retries2=$r2，建议为 5"
-    echo; info "客户端连上后，请确认查到的出口 IP 等于 ${BLD}B 的实时公网 IP${RST}"
-    info "如果显示的是 A 的 IP（$A_IP），说明路由没把用户流量送进 portal"
+    echo; info "逐个节点验收：连上后查出口 IP，必须等于${BLD}它对应那台出口机的实时公网 IP${RST}"
+    info "如果显示的是 A 的 IP（$A_IP），说明该节点的流量没进 portal"
+    info "如果两个节点查出同一个出口 IP，说明它们共用了出口，不是 1:1"
   elif [ -f "$STATE/b.env" ]; then
     source "$STATE/b.env"
     echo "角色: ${BLD}B（出口端）${RST}   拨向: $A_IP:$REVERSE_PORT"
@@ -918,11 +1277,13 @@ menu(){
     echo "  1) 部署服务器 A（境外入口机）"
     echo "  2) 部署服务器 B（AT&T 出口机，需 A 的 token）"
     echo "  3) 看节点分享链接"
-    echo "  4) 加一个节点"
-    echo "  5) 删除一个节点"
-    echo "  6) 运行自检"
-    echo "  7) SSH 搬到高位端口（可选，小心）"
-    echo "  8) 卸载"
+    echo "  4) 节点 / 出口机 对应表"
+    echo "  5) 加一个节点（同时生成它专属出口机的部署命令）"
+    echo "  6) 重新拿某节点的出口机部署命令"
+    echo "  7) 删除一个节点（连带它的出口绑定）"
+    echo "  8) 运行自检"
+    echo "  9) SSH 搬到高位端口（可选，小心）"
+    echo " 10) 卸载"
     echo "  0) 退出"
     echo
     read -rp "选择: " ch
@@ -930,11 +1291,13 @@ menu(){
       1) deploy_a ;;
       2) read -rp "粘贴 A 端给的 token: " t; deploy_b "$t" ;;
       3) show_links ;;
-      4) add_node ;;
-      5) del_node ;;
-      6) selfcheck ;;
-      7) ssh_migrate ;;
-      8) uninstall ;;
+      4) show_exits ;;
+      5) add_node ;;
+      6) show_exit_cmd ;;
+      7) del_node ;;
+      8) selfcheck ;;
+      9) ssh_migrate ;;
+      10) uninstall ;;
       0) exit 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -950,8 +1313,10 @@ case "${1:-}" in
   --links)    show_links ;;
   --add)      add_node "${2:-}" ;;
   --del|--delete|--remove) del_node "${2:-}" ;;
-  --list)     list_nodes ;;
+  --list)     show_exits ;;
+  --exit-cmd) show_exit_cmd "${2:-}" ;;
+  --migrate)  migrate_cfg ;;
   --version)  echo "att-tunnel v$VERSION" ;;
   "")         menu ;;
-  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --check | --links | --add NAME | --del NAME | --list）" ;;
+  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --check | --links | --list | --add NAME | --del NAME | --exit-cmd NAME | --migrate）" ;;
 esac
