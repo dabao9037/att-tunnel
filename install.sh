@@ -3,7 +3,7 @@
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
 set -euo pipefail
 
-VERSION="1.9.0"
+VERSION="1.10.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -641,7 +641,7 @@ EOF
   ok "B 端无任何入站监听，公网扫不到"
   ok "B 换 IP 无需任何操作，Xray 会自动重拨"
   echo
-  warn "如需把 SSH 迁到高位端口（降低暴露面），单独跑：菜单 5"
+  warn "如需把 SSH 迁到高位端口（降低暴露面），单独跑：菜单 7"
 }
 
 # ================= 节点管理 =================
@@ -717,6 +717,93 @@ PY
   [ -s "$tmp" ] || die "节点名已存在或配置解析失败"
   apply_cfg "$tmp"
   ok "节点 $name 已添加"
+  show_links
+}
+
+# 列出 user-in 里现有的节点名（一行一个）
+list_nodes(){
+  [ -f "$CFG" ] || return 1
+  ATT_CFG="$CFG" python3 - <<'PY'
+import json,os,sys
+try:
+    d=json.load(open(os.environ['ATT_CFG']))
+except Exception:
+    sys.exit(1)
+for ib in d.get('inbounds',[]):
+    if ib.get('tag')=='user-in':
+        for c in ib.get('settings',{}).get('clients',[]):
+            print(c.get('email','node'))
+PY
+}
+
+del_node(){
+  need_root
+  [ -f "$STATE/a.env" ] || die "只能在 A 端删节点"
+  local names; names=$(list_nodes) || die "读不到配置 $CFG"
+  [ -n "$names" ] || die "配置里没有任何节点"
+  local total; total=$(printf '%s\n' "$names" | grep -c .)
+
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    echo "${BLD}--- 当前节点 ---${RST}"
+    local i=0 n
+    while read -r n; do
+      [ -z "$n" ] && continue
+      i=$((i+1)); echo "  $i) $n"
+    done <<< "$names"
+    echo
+    read -rp "删除哪个节点？（输名称或序号，回车取消）: " name
+    [ -n "$name" ] || { warn "已取消"; return; }
+  fi
+
+  # 允许按序号选
+  if printf '%s' "$name" | grep -qE '^[0-9]+$'; then
+    local picked; picked=$(printf '%s\n' "$names" | sed -n "${name}p")
+    [ -n "$picked" ] || die "序号 $name 超出范围（共 $total 个）"
+    name="$picked"
+  fi
+
+  printf '%s\n' "$names" | grep -qxF "$name" || die "节点 $name 不存在"
+  # 入站至少要留一个 client，否则 Xray 校验不过；真要清空请走卸载
+  [ "$total" -gt 1 ] || die "这是最后一个节点，删掉入口就没人能用了。要停用请用菜单 8（卸载）"
+
+  read -rp "确认删除节点 ${BLD}$name${RST}？它的分享链接会立刻失效（输 yes）: " c
+  [ "$c" = yes ] || { warn "已取消"; return; }
+
+  local tmp; tmp=$(mktemp --suffix=.json)
+  local rc=0
+  DEL_NAME="$name" ATT_CFG="$CFG" python3 - > "$tmp" <<'PY' || rc=$?
+import json,os
+d=json.load(open(os.environ['ATT_CFG']))
+name=os.environ['DEL_NAME']
+found=False
+for ib in d.get('inbounds',[]):
+    if ib.get('tag')=='user-in':
+        cs=ib['settings']['clients']
+        keep=[c for c in cs if c.get('email')!=name]
+        if len(keep)!=len(cs):
+            found=True
+        if not keep:
+            raise SystemExit('LAST')
+        ib['settings']['clients']=keep
+if not found:
+    raise SystemExit('NOTFOUND')
+# 同步摘掉 portal 路由里的这个用户，否则留下悬空引用
+for r in d.get('routing',{}).get('rules',[]):
+    if 'user' in r:
+        r['user']=[u for u in r['user'] if u!=name]
+print(json.dumps(d,indent=1))
+PY
+  if [ "$rc" != 0 ] || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"
+    die "删除失败：配置解析异常或节点已不存在（原配置未改动）"
+  fi
+
+  # apply_cfg 会先 xray -test 校验，失败自动回滚
+  apply_cfg "$tmp"
+  ok "节点 $name 已删除（已备份原配置到 $CFG.bak-*）"
+  echo
+  info "剩下的节点："
   show_links
 }
 
@@ -832,9 +919,10 @@ menu(){
     echo "  2) 部署服务器 B（AT&T 出口机，需 A 的 token）"
     echo "  3) 看节点分享链接"
     echo "  4) 加一个节点"
-    echo "  5) 运行自检"
-    echo "  6) SSH 搬到高位端口（可选，小心）"
-    echo "  7) 卸载"
+    echo "  5) 删除一个节点"
+    echo "  6) 运行自检"
+    echo "  7) SSH 搬到高位端口（可选，小心）"
+    echo "  8) 卸载"
     echo "  0) 退出"
     echo
     read -rp "选择: " ch
@@ -843,9 +931,10 @@ menu(){
       2) read -rp "粘贴 A 端给的 token: " t; deploy_b "$t" ;;
       3) show_links ;;
       4) add_node ;;
-      5) selfcheck ;;
-      6) ssh_migrate ;;
-      7) uninstall ;;
+      5) del_node ;;
+      6) selfcheck ;;
+      7) ssh_migrate ;;
+      8) uninstall ;;
       0) exit 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -860,7 +949,9 @@ case "${1:-}" in
   --check)    selfcheck ;;
   --links)    show_links ;;
   --add)      add_node "${2:-}" ;;
+  --del|--delete|--remove) del_node "${2:-}" ;;
+  --list)     list_nodes ;;
   --version)  echo "att-tunnel v$VERSION" ;;
   "")         menu ;;
-  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --check | --links | --add NAME）" ;;
+  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --check | --links | --add NAME | --del NAME | --list）" ;;
 esac

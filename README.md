@@ -126,11 +126,25 @@ A 端菜单 `3` 看分享链接，任意支持 VLESS + REALITY + XHTTP 的客户
 |---|---|
 | 3 | 看节点分享链接 |
 | 4 | 加一个节点（复用同一条隧道） |
-| 5 | 运行自检 |
-| 6 | SSH 迁到高位端口（可选，需你自己确认新端口能登录后才收 22） |
-| 7 | 卸载（配置自动备份到 /root/att-tunnel-backup-*） |
+| 5 | 删除一个节点（该节点链接立刻失效） |
+| 6 | 运行自检 |
+| 7 | SSH 迁到高位端口（可选，需你自己确认新端口能登录后才收 22） |
+| 8 | 卸载（配置自动备份到 /root/att-tunnel-backup-*） |
 
-命令行等价：`--server-a` / `--bridge TOKEN` / `--links` / `--add NAME` / `--check`
+命令行等价：`--server-a` / `--bridge TOKEN` / `--links` / `--add NAME` / `--del NAME` / `--list` / `--check`
+
+### 删除节点
+
+菜单 `5` 会列出现有节点，输名称或序号都行，确认后立刻生效：
+
+```bash
+bash install.sh --del node2   # 非交互指定
+bash install.sh --list        # 只列出节点名
+```
+
+做了什么：从 `user-in` 的 clients 里摘掉该用户，同时清掉 `routing` 里对它的 portal 引用，避免留下悬空引用。改动走和加节点同一条 `apply_cfg` 路径 —— 先 `xray -test` 校验，原配置备份到 `config.json.bak-*`，服务起不来自动回滚。
+
+只在 A 端可用，B 端不存储用户。**最后一个节点不允许删**（入口没有 client 会导致 Xray 校验失败），要彻底停用请走菜单 `8` 卸载。
 
 ## 验收判据
 
