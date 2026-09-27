@@ -643,7 +643,7 @@ EOF
   ok "B 端无任何入站监听，公网扫不到"
   ok "B 换 IP 无需任何操作，Xray 会自动重拨"
   echo
-  warn "如需把 SSH 迁到高位端口（降低暴露面），单独跑：菜单 9"
+  warn "如需把 SSH 迁到高位端口（降低暴露面），单独跑：菜单 10"
 }
 
 # ================= 节点 / 出口机 管理 =================
@@ -817,6 +817,47 @@ PY
 ensure_migrated(){
   needs_migrate || return 0
   warn "当前是旧的单出口配置，先自动升级"
+  migrate_cfg
+}
+
+# 菜单入口：交互式平滑升级。比 --migrate 多一层说明和确认，
+# 且不会因为「本机不是 A 端 / 无需升级」就退出整个脚本。
+migrate_menu(){
+  if [ ! -f "$STATE/a.env" ]; then
+    warn "本机不是 A 端（入口机），不需要升级配置"
+    [ -f "$STATE/b.env" ] && info "B 端（出口机）无需任何改动，老 token 继续有效"
+    return 1
+  fi
+  if ! needs_migrate; then
+    ok "配置已经是 1:1 多出口结构，无需升级"
+    echo
+    show_exits || true
+    return 0
+  fi
+
+  echo "${BLD}--- 平滑升级为 1:1 多出口结构 ---${RST}"
+  echo
+  echo "当前配置是旧的单出口结构：所有节点共用一个 ${CYN}portal${RST} 标签，"
+  echo "也就是不管几个节点，出口永远是同一台出口机。"
+  echo
+  echo "升级会把标签改名为 ${CYN}portal-<首个节点名>${RST}，并让后续新增节点"
+  echo "各自绑定专属出口机。${BLD}bridge uuid 保持不变${RST}，所以："
+  echo "  ${GRN}•${RST} 出口机（B）不用重新部署，老 token 继续有效"
+  echo "  ${GRN}•${RST} 客户端分享链接不变，不用重新导入"
+  echo "  ${GRN}•${RST} 原配置自动备份到 $CFG.bak-*，服务起不来自动回滚"
+  echo
+  local n; n=$(list_nodes 2>/dev/null | grep -c . 2>/dev/null) || n=0
+  [ -n "$n" ] || n=0
+  if [ "$n" -gt 1 ] 2>/dev/null; then
+    warn "你现在有 $n 个节点共用一台出口机。升级${BLD}不会${RST}凭空造出新出口机，"
+    warn "它们升级后仍然共享。想让它们各走自己的出口机，升级完后："
+    warn "  先用菜单 7 删掉多余节点，再用菜单 5 每个重新加一台出口机"
+    echo
+  fi
+  warn "升级会重启 att-tunnel 服务，期间连接会断几秒"
+  read -rp "确认升级？（输 yes）: " c
+  [ "$c" = yes ] || { warn "已取消，配置未改动"; return; }
+  echo
   migrate_cfg
 }
 
@@ -1047,7 +1088,7 @@ del_node(){
 
   printf '%s\n' "$names" | grep -qxF "$name" || die "节点 $name 不存在"
   # 入站至少要留一个 client，否则 Xray 校验不过；真要清空请走卸载
-  [ "$total" -gt 1 ] || die "这是最后一个节点，删掉入口就没人能用了。要停用请用菜单 10（卸载）"
+  [ "$total" -gt 1 ] || die "这是最后一个节点，删掉入口就没人能用了。要停用请用菜单 11（卸载）"
 
   local ptag; ptag=$(printf '%s\n' "$rows" | awk -F'\t' -v n="$name" '$1==n{print $2}')
   echo
@@ -1152,7 +1193,7 @@ selfcheck(){
     if needs_migrate; then
       echo
       warn "配置还是旧的单出口结构（所有节点共一台 B）"
-      warn "跑菜单 5 或 7 会自动升级，也可直接跑：$0 --migrate"
+      warn "跑菜单 9 可以直接平滑升级（加/删节点时也会自动升），或跑：$0 --migrate"
     fi
     local rows nexit=0
     rows=$(list_exits 2>/dev/null || true)
@@ -1282,8 +1323,9 @@ menu(){
     echo "  6) 重新拿某节点的出口机部署命令"
     echo "  7) 删除一个节点（连带它的出口绑定）"
     echo "  8) 运行自检"
-    echo "  9) SSH 搬到高位端口（可选，小心）"
-    echo " 10) 卸载"
+    echo "  9) 升级配置为 1:1 多出口结构（平滑，客户端不变）"
+    echo " 10) SSH 搬到高位端口（可选，小心）"
+    echo " 11) 卸载"
     echo "  0) 退出"
     echo
     read -rp "选择: " ch
@@ -1296,8 +1338,9 @@ menu(){
       6) show_exit_cmd ;;
       7) del_node ;;
       8) selfcheck ;;
-      9) ssh_migrate ;;
-      10) uninstall ;;
+      9) migrate_menu ;;
+      10) ssh_migrate ;;
+      11) uninstall ;;
       0) exit 0 ;;
       *) warn "无效选择" ;;
     esac
