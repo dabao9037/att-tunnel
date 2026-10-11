@@ -928,6 +928,8 @@ print_b_cmd(){
 add_node(){
   need_root
   [ -f "$STATE/a.env" ] || die "只能在 A 端加节点"
+  # shellcheck disable=SC1090
+  source "$STATE/a.env"
   ensure_migrated
   local name="${1:-}"
   [ -n "$name" ] || { read -rp "节点名称（如 node2）: " name; }
