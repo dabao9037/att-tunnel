@@ -938,6 +938,12 @@ add_node(){
   printf '%s' "$name" | grep -qE '^[A-Za-z0-9_-]{1,32}$' \
     || die "名称只能用字母/数字/下划线/连字符，最多 32 位"
 
+  local uport
+  read -rp "为这个节点指定入口端口（回车使用已有的 ${USER_PORT:-443}）: " uport
+  [ -n "$uport" ] || uport="${USER_PORT:-443}"
+  case "$uport" in (*[!0-9]*) die "端口必须是数字";; esac
+  [ "$uport" -ge 1 ] && [ "$uport" -le 65535 ] || die "端口越界（1-65535）"
+
   local uuid buuid
   uuid=$("$XRAY_BIN" uuid)    # 客户端用
   buuid=$("$XRAY_BIN" uuid)   # 这个节点专属出口机用
