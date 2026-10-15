@@ -166,7 +166,27 @@ done
 # 交互式选择伪装域名
 pick_sni_interactive(){
   local working=()
-  info "正在验证候选伪装域名的 TLS 1.3 支持 ..."
+  
+  # 先显示所有候选域名，让用户知道有哪些选项
+  echo >&2
+  echo "${CYN}===== 候选伪装域名列表 =====${RST}" >&2
+  local i entry domain country
+  for i in "${!CANDIDATES[@]}"; do
+    domain="${CANDIDATES[$i]}"
+    country=""
+    for entry in "${CANDIDATES_WITH_COUNTRY[@]}"; do
+      if [[ "${entry%%|*}" == "$domain" ]]; then
+        country="${entry##*|}" 
+        break
+      fi
+    done
+    printf "  %2d. %-30s [%s]\n" $((i+1)) "$domain" "$country" >&2
+  done
+  echo "${CYN}==============================${RST}" >&2
+  echo >&2
+  
+  # 再验证 TLS 1.3 支持
+  info "正在验证候选域名的 TLS 1.3 支持（需要几秒钟）..." >&2
   local d
   for d in "${CANDIDATES[@]}"; do
     if timeout 8 openssl s_client -connect "$d:443" -tls1_3 -servername "$d" </dev/null 2>/dev/null \
@@ -179,12 +199,11 @@ pick_sni_interactive(){
     die "所有候选域名均不支持 TLS 1.3，请检查网络"
   fi
   
-  echo
-  echo "${CYN}===== 可用伪装域名列表 =====${RST}"
-  local i entry domain country
+  # 显示验证通过的域名
+  echo >&2
+  echo "${GRN}===== 验证通过的伪装域名 =====${RST}" >&2
   for i in "${!working[@]}"; do
     domain="${working[$i]}"
-    # 从 CANDIDATES_WITH_COUNTRY 中查找对应的国家
     country=""
     for entry in "${CANDIDATES_WITH_COUNTRY[@]}"; do
       if [[ "${entry%%|*}" == "$domain" ]]; then
@@ -192,19 +211,19 @@ pick_sni_interactive(){
         break
       fi
     done
-    printf "  %2d. %-30s [%s]\n" $((i+1)) "$domain" "$country"
+    printf "  %2d. %-30s [%s]\n" $((i+1)) "$domain" "$country" >&2
   done
-  echo "${CYN}==============================${RST}"
-  echo
+  echo "${GRN}==============================${RST}" >&2
+  echo >&2
   
   local choice
   while true; do
-    read -r -p "请选择伪装域名 [1-${#working[@]}]: " choice
+    read -r -p "请选择伪装域名 [1-${#working[@]}]: " choice >&2
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#working[@]} ]; then
       echo "${working[$((choice-1))]}"
       return 0
     fi
-    warn "无效选择，请输入 1-${#working[@]} 之间的数字"
+    warn "无效选择，请输入 1-${#working[@]} 之间的数字" >&2
   done
 }
 
