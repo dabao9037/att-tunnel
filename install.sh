@@ -163,83 +163,60 @@ for entry in "${CANDIDATES_WITH_COUNTRY[@]}"; do
   CANDIDATES+=("${entry%%|*}")
 done
 
-# 交互式选择伪装域名
+# 单个域名 TLS 1.3 实测
+sni_ok(){
+  timeout 8 openssl s_client -connect "$1:443" -tls1_3 -servername "$1" </dev/null 2>/dev/null \
+    | grep -q 'TLSv1.3'
+}
+
+# 交互式选择伪装域名。
+# 结果写入全局变量 SNI_PICKED，不走 $(...) 捕获：
+# 之前用 sni=$(pick_sni_interactive)，列表/提示一旦混进 stdout 就被吞进 sni，
+# 表现为“先出提示、选完才出列表”，并把多行文本写进 config.json 导致 xray 报
+# invalid character '\n' in string literal。
+SNI_PICKED=""
 pick_sni_interactive(){
-  local working=()
-  
-  # 先显示所有候选域名，让用户知道有哪些选项
-  echo >&2
-  echo "${CYN}===== 候选伪装域名列表 =====${RST}" >&2
-  local i entry domain country
-  for i in "${!CANDIDATES[@]}"; do
-    domain="${CANDIDATES[$i]}"
-    country=""
-    for entry in "${CANDIDATES_WITH_COUNTRY[@]}"; do
-      if [[ "${entry%%|*}" == "$domain" ]]; then
-        country="${entry##*|}" 
-        break
-      fi
-    done
-    printf "  %2d. %-30s [%s]\n" $((i+1)) "$domain" "$country" >&2
-  done
-  echo "${CYN}==============================${RST}" >&2
-  echo >&2
-  
-  # 再验证 TLS 1.3 支持
-  info "正在验证候选域名的 TLS 1.3 支持（需要几秒钟）..." >&2
-  local d
-  for d in "${CANDIDATES[@]}"; do
-    if timeout 8 openssl s_client -connect "$d:443" -tls1_3 -servername "$d" </dev/null 2>/dev/null \
-       | grep -q 'TLSv1.3'; then
-      working+=("$d")
+  SNI_PICKED=""
+  local i d country choice usable=()
+  echo
+  echo "${CYN}===== 伪装域名（逐个实测 TLS 1.3，约需几秒）=====${RST}"
+  for i in "${!CANDIDATES_WITH_COUNTRY[@]}"; do
+    d="${CANDIDATES_WITH_COUNTRY[$i]%%|*}"
+    country="${CANDIDATES_WITH_COUNTRY[$i]##*|}"
+    printf "  %2d. %-30s [%s] " $((i+1)) "$d" "$country"
+    if sni_ok "$d"; then
+      printf "%s\n" "${GRN}可用${RST}"
+      usable+=($((i+1)))
+    else
+      printf "%s\n" "${RED}不可用${RST}"
     fi
   done
-  
-  if [ ${#working[@]} -eq 0 ]; then
-    die "所有候选域名均不支持 TLS 1.3，请检查网络"
-  fi
-  
-  # 显示验证通过的域名
-  echo >&2
-  echo "${GRN}===== 验证通过的伪装域名 =====${RST}" >&2
-  for i in "${!working[@]}"; do
-    domain="${working[$i]}"
-    country=""
-    for entry in "${CANDIDATES_WITH_COUNTRY[@]}"; do
-      if [[ "${entry%%|*}" == "$domain" ]]; then
-        country="${entry##*|}" 
-        break
-      fi
-    done
-    printf "  %2d. %-30s [%s]\n" $((i+1)) "$domain" "$country" >&2
-  done
-  echo "${GRN}==============================${RST}" >&2
-  echo >&2
-  
-  local choice
+  echo "${CYN}==============================================${RST}"
+  echo "${YEL}提示：选入口服务器(A)所在国家/地区的网站，伪装效果更好${RST}"
+  [ ${#usable[@]} -gt 0 ] || return 1
+
   while true; do
-    read -r -p "请选择伪装域名 [1-${#working[@]}]: " choice >&2
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#working[@]} ]; then
-      echo "${working[$((choice-1))]}"
+    read -r -p "请选择伪装域名序号 [回车默认 ${usable[0]}]: " choice || return 1
+    [ -z "$choice" ] && choice="${usable[0]}"
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ " ${usable[*]} " == *" $choice "* ]]; then
+      SNI_PICKED="${CANDIDATES_WITH_COUNTRY[$((choice-1))]%%|*}"
       return 0
     fi
-    warn "无效选择，请输入 1-${#working[@]} 之间的数字" >&2
+    warn "无效选择，请输入上面标“可用”的序号"
   done
 }
 
 pick_sni(){
   # 手动指定优先：ATT_SNI=www.example.com
   if [ -n "${ATT_SNI:-}" ]; then
-    if timeout 8 openssl s_client -connect "$ATT_SNI:443" -tls1_3 -servername "$ATT_SNI" </dev/null 2>/dev/null \
-       | grep -q 'TLSv1.3'; then
+    if sni_ok "$ATT_SNI"; then
       echo "$ATT_SNI"; return 0
     fi
     warn "指定的 $ATT_SNI 不支持 TLS 1.3，改用预置列表" >&2
   fi
   local d
   for d in "${CANDIDATES[@]}"; do
-    if timeout 8 openssl s_client -connect "$d:443" -tls1_3 -servername "$d" </dev/null 2>/dev/null \
-       | grep -q 'TLSv1.3'; then
+    if sni_ok "$d"; then
       echo "$d"; return 0
     fi
   done
@@ -421,8 +398,11 @@ deploy_a(){
     info "使用指定的 REALITY 回落域名: $ATT_SNI"
     sni=$(pick_sni) || die "指定的回落域名不可用"
   else
-    sni=$(pick_sni_interactive) || die "候选回落域名均不可用，请检查网络"
+    pick_sni_interactive || die "候选回落域名均不可用，请检查网络"
+    sni="$SNI_PICKED"
   fi
+  # 写进 config.json 前兜底：只允许纯域名，杜绝换行/空格把 JSON 弄坏
+  [[ "$sni" =~ ^[A-Za-z0-9.-]+$ ]] || die "回落域名异常: '$sni'"
   ok "回落域名: $sni"
 
   local rport; rport=$(free_port)
