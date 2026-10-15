@@ -145,6 +145,43 @@ install_xray(){
 CANDIDATES=(www.atlasobscura.com www.backblaze.com www.gog.com www.cern.ch \
             www.sciencemuseum.org.uk www.visitsingapore.com www.discoverhongkong.com \
             www.a-star.edu.sg www.animatetimes.com www.famitsu.com www.jodrellbank.net)
+
+# 交互式选择伪装域名
+pick_sni_interactive(){
+  local working=()
+  info "正在验证候选伪装域名的 TLS 1.3 支持 ..."
+  local d
+  for d in "${CANDIDATES[@]}"; do
+    if timeout 8 openssl s_client -connect "$d:443" -tls1_3 -servername "$d" </dev/null 2>/dev/null \
+       | grep -q 'TLSv1.3'; then
+      working+=("$d")
+    fi
+  done
+  
+  if [ ${#working[@]} -eq 0 ]; then
+    die "所有候选域名均不支持 TLS 1.3，请检查网络"
+  fi
+  
+  echo
+  echo "${CYN}===== 可用伪装域名列表 =====${RST}"
+  local i
+  for i in "${!working[@]}"; do
+    printf "  %2d. %s\n" $((i+1)) "${working[$i]}"
+  done
+  echo "${CYN}==============================${RST}"
+  echo
+  
+  local choice
+  while true; do
+    read -r -p "请选择伪装域名 [1-${#working[@]}]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#working[@]} ]; then
+      echo "${working[$((choice-1))]}"
+      return 0
+    fi
+    warn "无效选择，请输入 1-${#working[@]} 之间的数字"
+  done
+}
+
 pick_sni(){
   # 手动指定优先：ATT_SNI=www.example.com
   if [ -n "${ATT_SNI:-}" ]; then
@@ -334,8 +371,13 @@ deploy_a(){
     echo
   fi
 
-  info "挑选可用 REALITY 回落域名 ..."
-  local sni; sni=$(pick_sni) || die "候选回落域名均不可用，请检查网络"
+  local sni
+  if [ -n "${ATT_SNI:-}" ]; then
+    info "使用指定的 REALITY 回落域名: $ATT_SNI"
+    sni=$(pick_sni) || die "指定的回落域名不可用"
+  else
+    sni=$(pick_sni_interactive) || die "候选回落域名均不可用，请检查网络"
+  fi
   ok "回落域名: $sni"
 
   local rport; rport=$(free_port)
