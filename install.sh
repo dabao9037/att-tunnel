@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # att-tunnel — AT&T 线路丢包根治：Xray VLESS Reverse 反向隧道一键部署
 # 不绑域名，B 端直连 A 的公网 IP；B 换 IP 自动重连。
-set -euo pipefail
+set -Eeuo pipefail
+# head 提前关管道会让上游收到 SIGPIPE(141)，配合 pipefail+set -e 会静默退出。
+# 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
+trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
 VERSION="2.0.0"
 XRAY_BIN="/usr/local/bin/xray"
@@ -76,7 +79,7 @@ install_xray(){
   local want="${XRAY_VER#v}"
   local cur=""
   if [ -x /usr/local/bin/xray ]; then
-    cur=$(/usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}')
+    cur=$(/usr/local/bin/xray version 2>/dev/null | awk 'NR==1{print $2}')
   fi
 
   if [ -n "$cur" ] && [ "$cur" = "$want" ]; then
@@ -99,7 +102,7 @@ install_xray(){
     [ -x "$p" ] && { other="$p"; break; }
   done
   if [ -n "${other:-}" ]; then
-    local ov; ov=$("$other" version 2>/dev/null | head -1 | awk '{print $2}')
+    local ov; ov=$("$other" version 2>/dev/null | awk 'NR==1{print $2}')
     info "检测到其他 Xray：$other（$ov）—— 不使用、不修改它"
   fi
 
@@ -133,7 +136,7 @@ install_xray(){
   rm -rf "$tmpd"
   XRAY_BIN="/usr/local/bin/xray"
   [ -x "$XRAY_BIN" ] || die "安装后未找到 $XRAY_BIN"
-  ok "Xray 已安装: $("$XRAY_BIN" version | head -1)"
+  ok "Xray 已安装: $("$XRAY_BIN" version | sed -n 1p)"
 
   detect_reverse_style
 }
@@ -282,7 +285,7 @@ apply_cfg(){
   systemctl restart "$SVC"
   sleep 2
   systemctl is-active --quiet "$SVC" || {
-    local bak; bak=$(ls -t "$CFG".bak-* 2>/dev/null | head -1)
+    local bak; bak=$(ls -t "$CFG".bak-* 2>/dev/null | sed -n 1p)
     [ -n "$bak" ] && { cp "$bak" "$CFG"; systemctl restart "$SVC"; }
     echo "--- 服务日志 ---"; journalctl -u "$SVC" -n 15 --no-pager 2>&1 | tail -10
     die "启动失败，已回滚"
@@ -319,7 +322,7 @@ open_fw(){
   # 很多 VPS 没有 ufw/firewalld，但 iptables INPUT 默认 DROP 或有拦截规则。
   # 上一版只看 ufw/firewalld，所以反代端口实际被 iptables 拦掉。
   if command -v iptables >/dev/null 2>&1; then
-    local pol; pol=$(iptables -L INPUT -n 2>/dev/null | head -1)
+    local pol; pol=$(iptables -L INPUT -n 2>/dev/null | sed -n 1p)
     if echo "$pol" | grep -q 'policy DROP' || iptables -L INPUT -n 2>/dev/null | grep -qE '^(DROP|REJECT)'; then
       if ! iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; then
         iptables -I INPUT 1 -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
@@ -415,8 +418,8 @@ deploy_a(){
   priv=$(echo "$kp" | awk '/PrivateKey/{print $2}')
   pub=$(echo "$kp"  | awk '/Password/{print $3}')
   local ve; ve=$("$XRAY_BIN" vlessenc 2>/dev/null)
-  dec=$(echo "$ve" | grep -o '"decryption": "[^"]*"' | head -1 | cut -d'"' -f4)
-  enc=$(echo "$ve" | grep -o '"encryption": "[^"]*"' | head -1 | cut -d'"' -f4)
+  dec=$(echo "$ve" | grep -o '"decryption": "[^"]*"' | sed -n 1p | cut -d'"' -f4)
+  enc=$(echo "$ve" | grep -o '"encryption": "[^"]*"' | sed -n 1p | cut -d'"' -f4)
   [ -n "$dec" ] && [ -n "$enc" ] || die "VLESS Encryption 生成失败（Xray 版本过旧？）"
 
   # 新/旧 reverse 语法差异：
@@ -1250,7 +1253,7 @@ selfcheck(){
   echo "${BLD}--- 运行自检 ---${RST}"
   if systemctl is-active --quiet "$SVC"; then ok "$SVC active"; else echo "${RED}[X]${RST} $SVC 未运行"; fi
   if [ -x /usr/local/bin/xray ]; then
-    local xv; xv=$(/usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}')
+    local xv; xv=$(/usr/local/bin/xray version 2>/dev/null | awk 'NR==1{print $2}')
     if [ "$xv" = "${XRAY_VER#v}" ]; then
       ok "专用 Xray 版本 $xv（两端必须一致）"
     else
@@ -1302,7 +1305,7 @@ selfcheck(){
       warn "没有来自 B 的 ESTAB —— 出口机未部署或端口被封"
     else
       ok "反向隧道连接数：$ntun（已绑定出口：$nexit）"
-      ss -tn state established 2>/dev/null | grep ":$REVERSE_PORT" | head -5 | sed 's/^/    /'
+      ss -tn state established 2>/dev/null | grep ":$REVERSE_PORT" | sed -n 1,5p | sed 's/^/    /'
       if [ "$nexit" -gt 0 ] && [ "$ntun" -lt "$nexit" ]; then
         warn "隧道数少于出口数 —— 有出口机没连上（未部署 / 安全组未放行 / 已关机）"
       fi
