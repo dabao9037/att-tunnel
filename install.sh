@@ -1425,7 +1425,8 @@ menu(){
   done
 }
 
-RAW_URL="https://raw.githubusercontent.com/dabao9037/att-tunnel/main/install.sh"
+# 生成给 B 的命令用哪个脚本地址；测试分支/指定提交时用 ATT_RAW_URL 覆盖
+RAW_URL="${ATT_RAW_URL:-https://raw.githubusercontent.com/dabao9037/att-tunnel/main/install.sh}"
 
 case "${1:-}" in
   --bridge)   need_root; deploy_b "${2:-}" ;;
