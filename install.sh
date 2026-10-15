@@ -142,9 +142,26 @@ install_xray(){
 # 与 NodeLite 保持一致的预置列表（NodeLite 默认 www.atlasobscura.com）。
 # 已逐个做过真实 REALITY 握手实测（Xray 26.3.27），
 # NodeLite 预置中的 www.hkstp.org 实测不通，故不纳入。
-CANDIDATES=(www.atlasobscura.com www.backblaze.com www.gog.com www.cern.ch \
-            www.sciencemuseum.org.uk www.visitsingapore.com www.discoverhongkong.com \
-            www.a-star.edu.sg www.animatetimes.com www.famitsu.com www.jodrellbank.net)
+# 伪装域名列表：域名 | 国家
+CANDIDATES_WITH_COUNTRY=(
+  "www.atlasobscura.com|美国"
+  "www.backblaze.com|美国"
+  "www.gog.com|波兰"
+  "www.cern.ch|瑞士"
+  "www.sciencemuseum.org.uk|英国"
+  "www.visitsingapore.com|新加坡"
+  "www.discoverhongkong.com|中国香港"
+  "www.a-star.edu.sg|新加坡"
+  "www.animatetimes.com|日本"
+  "www.famitsu.com|日本"
+  "www.jodrellbank.net|英国"
+)
+
+# 提取纯域名列表（向后兼容）
+CANDIDATES=()
+for entry in "${CANDIDATES_WITH_COUNTRY[@]}"; do
+  CANDIDATES+=("${entry%%|*}")
+done
 
 # 交互式选择伪装域名
 pick_sni_interactive(){
@@ -164,9 +181,18 @@ pick_sni_interactive(){
   
   echo
   echo "${CYN}===== 可用伪装域名列表 =====${RST}"
-  local i
+  local i entry domain country
   for i in "${!working[@]}"; do
-    printf "  %2d. %s\n" $((i+1)) "${working[$i]}"
+    domain="${working[$i]}"
+    # 从 CANDIDATES_WITH_COUNTRY 中查找对应的国家
+    country=""
+    for entry in "${CANDIDATES_WITH_COUNTRY[@]}"; do
+      if [[ "${entry%%|*}" == "$domain" ]]; then
+        country="${entry##*|}" 
+        break
+      fi
+    done
+    printf "  %2d. %-30s [%s]\n" $((i+1)) "$domain" "$country"
   done
   echo "${CYN}==============================${RST}"
   echo
