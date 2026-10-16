@@ -1471,7 +1471,7 @@ ENVF = os.environ.get('ATT_WEB_ENV', '/etc/att-tunnel/web.env')
 AENV = os.environ.get('ATT_A_ENV', '/etc/att-tunnel/a.env')
 STATEF = os.environ.get('ATT_WEB_STATE', '/var/lib/att-tunnel/web-state.json')
 XRAY = os.environ.get('ATT_XRAY', '/usr/local/bin/xray')
-SCRIPT = os.environ.get('ATT_SCRIPT', '/usr/local/lib/att-tunnel/att-tunnel.sh')
+SCRIPT = '/nonexistent/att-tunnel.sh'  # 本版本只读
 SVC = os.environ.get('ATT_SVC', 'att-tunnel')
 POLL = int(os.environ.get('ATT_POLL', '10'))
 PROBE_EVERY = int(os.environ.get('ATT_PROBE_EVERY', '300'))
@@ -1843,6 +1843,56 @@ def status_json():
                 'error': cfg_err or state['poll_err'], 'nodes': out, 'busy': mut_lock.locked(), 'manage': False}
 
 
+def run_script(args, extra_env=None, timeout=180):
+    """非交互调用脚本副本。返回 (rc, 去掉颜色码的输出)。"""
+    if not os.path.isfile(SCRIPT):
+        return 127, '找不到脚本副本 %s：请在 A 机上重跑一次 --web' % SCRIPT
+    env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+           'HOME': '/root', 'LANG': 'C.UTF-8', 'ATT_NONINTERACTIVE': '1', 'ATT_FROM_WEB': '1'}
+    if RAW_URL:
+        env['ATT_RAW_URL'] = RAW_URL
+    env.update(extra_env or {})
+    try:
+        p = subprocess.run(['bash', SCRIPT] + args, stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return 124, '脚本执行超时（%ds）' % timeout
+    txt = ANSI_RE.sub('', (p.stdout or '') + (p.stderr or ''))
+    return p.returncode, txt.strip()[-6000:]
+
+
+SNI_PRESETS = "ATT_SNI_PRESETS"   # write_web_py 替换成脚本里的预置列表 [[域名, 国家], ...]
+
+
+def node_names():
+    try:
+        return [x['name'] for x in read_cfg()['nodes']]
+    except Exception:
+        return []
+
+
+def node_link(name):
+    """按需取分享链接 + 出口机命令（都来自脚本本身）。"""
+    rc, out = run_script(['--link', name], timeout=30)
+    link = next((l.strip() for l in out.splitlines() if l.strip().startswith('vless://')), '')
+    if rc != 0 or not link:
+        raise RuntimeError(out or '取分享链接失败')
+    rc, out = run_script(['--exit-cmd', name], timeout=30)
+    cmd = next((l.strip() for l in out.splitlines() if '--bridge ' in l), '')
+    if rc != 0 or not cmd:
+        raise RuntimeError(out or '取出口机命令失败')
+    return {'name': name, 'link': link, 'exit_cmd': cmd}
+
+
+def after_change(name=None):
+    """加/删节点后：清理已删节点的记录，立刻轮询一次，并探测新节点。"""
+    keep = set(node_names())
+    with lock:
+        for k in [k for k in state['nodes'] if k not in keep]:
+            del state['nodes'][k]
+    poll_stats()
+    if name and name in keep:
+        threading.Thread(target=probe_all, kwargs={'only': name}, daemon=True).start()
 
 
 sessions = {}   # sid -> {'exp': ts, 'csrf': token}
@@ -1873,55 +1923,162 @@ def new_session():
     return sid
 
 
+CSS = '''
+:root{--bg:#f3f5f9;--card:#fff;--fg:#0f172a;--mut:#64748b;--line:#e2e8f0;--pri:#2563eb;--pri2:#1d4ed8;
+--ok:#16a34a;--okb:#dcfce7;--bad:#dc2626;--badb:#fee2e2;--warn:#b45309;--warnb:#fef3c7;--sh:0 1px 3px #0f172a14,0 4px 16px #0f172a0d}
+@media(prefers-color-scheme:dark){:root{--bg:#0b1020;--card:#141b2d;--fg:#e2e8f0;--mut:#94a3b8;--line:#243049;
+--pri:#3b82f6;--pri2:#60a5fa;--ok:#4ade80;--okb:#14532d66;--bad:#f87171;--badb:#7f1d1d66;--warn:#fbbf24;--warnb:#78350f66;--sh:0 1px 3px #0006}}
+*{box-sizing:border-box}html,body{margin:0}body{font:15px/1.5 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--fg)}
+button,input,select{font:inherit;color:inherit}
+.btn{border:1px solid var(--line);background:var(--card);padding:8px 14px;border-radius:10px;cursor:pointer;white-space:nowrap}
+.btn:hover{border-color:var(--pri)}.btn:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--pri);outline-offset:2px}
+.btn.p{background:var(--pri);border-color:var(--pri);color:#fff}.btn.p:hover{background:var(--pri2)}
+.btn.d{color:var(--bad)}.btn.d:hover{border-color:var(--bad)}.btn.s{padding:5px 10px;font-size:13px}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+input,select{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
+label{display:block;font-size:13px;color:var(--mut);margin:10px 0 4px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--sh)}
+.mut{color:var(--mut)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;word-break:break-all}
+.err{color:var(--bad)}
+'''
+
 PAGE_LOGIN = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>att-tunnel 登录</title>
-<style>body{font-family:system-ui,sans-serif;background:#f4f5f7;margin:0;display:flex;
-min-height:100vh;align-items:center;justify-content:center}form{background:#fff;padding:24px;
-border-radius:12px;box-shadow:0 2px 12px #0001;width:min(320px,90vw)}input,button{width:100%;
-box-sizing:border-box;padding:10px;margin-top:10px;font-size:16px;border-radius:8px;
-border:1px solid #ccc}button{background:#2563eb;color:#fff;border:0}.e{color:#c00}</style></head>
-<body><form method="post" action="{P}/login"><h2>att-tunnel 流量面板</h2>{E}
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark">
+<title>att-tunnel 登录</title><style>{CSS}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+form{width:min(360px,100%);padding:28px}h1{font-size:20px;margin:0 0 4px}.logo{font-size:28px}
+.btn{width:100%;margin-top:16px;padding:11px}</style></head>
+<body><form class="card" method="post" action="{P}/login"><div class="logo" aria-hidden="true">🛰️</div>
+<h1>att-tunnel 面板</h1><p class="mut" style="margin:0 0 8px">反向隧道 · 流量与节点管理</p>{E}
 <label for="pw">密码</label><input id="pw" type="password" name="password" autocomplete="current-password" required autofocus>
-<button type="submit">登录</button></form></body></html>'''
+<button class="btn p" type="submit">登录</button></form></body></html>'''
+
 PAGE_MAIN = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>att-tunnel 流量面板</title>
-<style>body{font-family:system-ui,sans-serif;background:#f4f5f7;margin:0;padding:12px;color:#222}
-h1{font-size:20px;margin:4px 0 12px}.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
-button{padding:8px 14px;border-radius:8px;border:1px solid #bbb;background:#fff;font-size:15px;cursor:pointer}
-button.p{background:#2563eb;color:#fff;border:0}button.d{color:#b91c1c;border-color:#e5a5a5}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
-.card{background:#fff;border-radius:12px;padding:14px;box-shadow:0 1px 6px #0001}
-.card h2{font-size:17px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:center}
-.on{color:#15803d}.off{color:#b91c1c}dl{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;margin:0 0 10px}
-dt{color:#666}dd{margin:0;word-break:break-all}.m{color:#666;font-size:13px}.err{color:#b91c1c}#err:not(:empty){background:#fee2e2;border:1px solid #fca5a5;padding:10px 14px;border-radius:10px;margin-bottom:12px;font-weight:600}</style></head>
-<body><h1>att-tunnel 流量面板</h1>
-<div class="bar"><button class="p" id="probe" type="button">立即探测出口 IP</button>
-<button id="refresh" type="button">刷新</button>
-<form method="post" action="{P}/logout" style="margin:0"><input type="hidden" name="csrf" value="{C}">
-<button type="submit">退出</button></form><span class="m" id="meta" aria-live="polite"></span></div>
-<div class="err" id="err" role="alert"></div><div class="grid" id="list"></div>
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark">
+<title>att-tunnel 面板</title><style>{CSS}
+.wrap{max-width:1180px;margin:0 auto;padding:16px}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding:16px 20px;margin-bottom:16px}
+header h1{font-size:19px;margin:0}.hinfo{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px}
+.acts{display:flex;gap:8px;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600}
+.pill::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
+.pill.on{color:var(--ok);background:var(--okb)}.pill.off{color:var(--bad);background:var(--badb)}.pill.w{color:var(--warn);background:var(--warnb)}
+.sum{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px}
+.sum .card{padding:14px 16px}.sum b{display:block;font-size:24px;font-weight:700;margin-top:2px}
+.alert{padding:12px 16px;margin-bottom:16px;border-color:var(--bad);color:var(--bad);background:var(--badb);display:none;white-space:pre-wrap}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+.node{padding:16px}.node h2{font-size:17px;margin:0;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:12px 0;font-size:14px}.kv dt{color:var(--mut)}.kv dd{margin:0;word-break:break-all}
+.tr{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0}.tr div{background:var(--bg);border-radius:10px;padding:8px 10px}
+.tr small{color:var(--mut);display:block;font-size:12px}.tr b{font-size:16px}
+.barw{height:6px;background:var(--bg);border-radius:9px;overflow:hidden;margin:6px 0 2px}.bar{height:100%;background:linear-gradient(90deg,var(--pri),#8b5cf6);border-radius:9px}
+svg.spark{width:100%;height:34px;display:block}svg.spark path{fill:none;stroke:var(--pri);stroke-width:1.5}
+.nact{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.sec{display:flex;align-items:center;justify-content:space-between;margin:20px 0 10px}.sec h3{margin:0;font-size:16px}
+.empty{padding:30px;text-align:center}
+dialog{border:1px solid var(--line);border-radius:16px;background:var(--card);color:var(--fg);padding:0;width:min(560px,94vw);box-shadow:var(--sh)}
+dialog::backdrop{background:#0008}.dh{padding:16px 20px;border-bottom:1px solid var(--line);font-weight:700}
+.db{padding:4px 20px 16px}.df{padding:12px 20px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end}
+.row{display:flex;gap:8px}.row>*{flex:1}
+.copy{display:flex;gap:6px;align-items:flex-start;background:var(--bg);border-radius:10px;padding:8px 10px;margin-top:4px}.copy .mono{flex:1}
+pre.out{max-height:220px;overflow:auto;background:var(--bg);padding:10px;border-radius:10px;font-size:12px;white-space:pre-wrap}
+#toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:9;max-width:min(380px,90vw)}
+.toast{padding:10px 14px;border-radius:12px;color:#fff;background:#0f172a;box-shadow:var(--sh);font-size:14px}
+.toast.ok{background:#15803d}.toast.bad{background:#b91c1c}
+@media(max-width:760px){.sum{grid-template-columns:repeat(2,1fr)}.sum .card:last-child{grid-column:1/-1}.wrap{padding:10px}header{padding:14px}}
+</style></head><body><div class="wrap">
+<header class="card"><div><h1>🛰️ att-tunnel 面板 <span class="mut" style="font-size:13px;font-weight:400" id="ver"></span></h1>
+<div class="hinfo mut" id="hinfo">加载中…</div></div>
+<div class="acts"><button class="btn p" id="bAdd" type="button" hidden>＋ 添加节点</button>
+<button class="btn" id="bProbe" type="button">立即探测</button><button class="btn" id="bRef" type="button">刷新</button>
+<form method="post" action="{P}/logout" style="margin:0"><input type="hidden" name="csrf" value="{C}"><button class="btn" type="submit">退出</button></form></div></header>
+<div class="card alert" id="err" role="alert"></div>
+<div class="sum" id="sum"></div>
+<div class="sec"><h3>节点</h3><span class="mut" style="font-size:13px" id="meta" aria-live="polite"></span></div>
+<div class="grid" id="list"></div></div>
+<div id="toasts" aria-live="polite"></div>
+'''
+PAGE_MAIN += '''
+<dialog id="dAdd" aria-labelledby="dAddH"><form id="fAdd" method="dialog"><div class="dh" id="dAddH">添加节点</div><div class="db">
+<label for="aName">节点名称（字母/数字/下划线/连字符，最多 32 位）</label><input id="aName" name="name" required maxlength="32" pattern="[A-Za-z0-9_-]{1,32}" placeholder="如 LA2" autocomplete="off">
+<label for="aPort">入口端口（留空 = 与主入口共用 <span id="defPort"></span>）</label><input id="aPort" name="port" inputmode="numeric" pattern="[0-9]{1,5}" placeholder="留空即可">
+<label for="aSni">伪装域名（只在单独端口时生效；共用端口时沿用主入口的 <span id="defSni"></span>）</label><select id="aSni" name="sni"></select>
+<div id="aCustW" hidden><label for="aCust">自定义域名（需支持 TLS 1.3）</label><input id="aCust" placeholder="www.example.com" autocomplete="off"></div>
+<p class="mut" style="font-size:13px">添加会重启 att-tunnel，已有连接断开几秒。失败会自动回滚。</p></div>
+<div class="df"><button class="btn" type="button" data-close>取消</button><button class="btn p" type="submit" id="aGo">添加</button></div></form></dialog>
+<dialog id="dRes" aria-labelledby="dResH"><div class="dh" id="dResH">节点信息</div><div class="db" id="resB"></div>
+<div class="df"><button class="btn p" type="button" data-close>关闭</button></div></dialog>
+<dialog id="dDel" aria-labelledby="dDelH"><form id="fDel" method="dialog"><div class="dh" id="dDelH">删除节点</div><div class="db">
+<p>删除后节点 <b id="delN"></b> 的分享链接立即失效，它的出口机会失去连接（需自己去出口机卸载）。</p>
+<label for="delIn">请输入节点名确认</label><input id="delIn" autocomplete="off" required></div>
+<div class="df"><button class="btn" type="button" data-close>取消</button><button class="btn d" type="submit" id="delGo" disabled>删除</button></div></form></dialog>
+<dialog id="dOut" aria-labelledby="dOutH"><div class="dh err" id="dOutH">操作失败</div><div class="db"><p id="outMsg"></p><pre class="out" id="outTxt"></pre></div>
+<div class="df"><button class="btn p" type="button" data-close>关闭</button></div></dialog>
 <script>
-const P="{P}",C="{C}";
-function fb(n){const u=["B","KB","MB","GB","TB"];let i=0;while(n>=1024&&i<4){n/=1024;i++}return n.toFixed(i?2:0)+" "+u[i]}
-function ft(t){if(!t)return"从未";const d=new Date(t*1000);return d.toLocaleString("zh-CN",{hour12:false})}
+const P="{P}",C="{C}",SNIS={SNIS};let D=null,busy=false;
+const $=i=>document.getElementById(i);
+function fb(n){n=+n||0;const u=["B","KB","MB","GB","TB","PB"];let i=0;while(n>=1024&&i<5){n/=1024;i++}return(i?n.toFixed(n<10?2:n<100?1:0):n)+" "+u[i]}
+function ago(t){if(!t)return"从未";const s=Math.max(0,Math.floor(Date.now()/1000)-t);if(s<60)return s+" 秒前";if(s<3600)return Math.floor(s/60)+" 分钟前";if(s<86400)return Math.floor(s/3600)+" 小时前";return new Date(t*1000).toLocaleString("zh-CN",{hour12:false})}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
-async function post(u,body){const r=await fetch(P+u,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":C},body:new URLSearchParams(body)});if(r.status==401)location.href=P+"/";return r}
-async function load(){try{const r=await fetch(P+"/api/status",{cache:"no-store"});if(r.status==401){location.href=P+"/";return}
-const d=await r.json();document.getElementById("err").textContent=d.error?("⚠ 统计异常："+d.error):"";
-document.getElementById("meta").textContent="流量更新于 "+ft(d.last_poll)+"（每 "+d.poll+" 秒）"+(d.last_poll&&d.now-d.last_poll>3*d.poll+5?" · 已停止更新！":"");
-document.getElementById("list").innerHTML=d.nodes.map(n=>`<section class="card"><h2><span>${esc(n.name)}</span>
-<span class="${n.online?"on":"off"}">${n.online?"● 在线":"● 离线"}</span></h2><dl>
-<dt>入口端口</dt><dd>${esc(n.port)}</dd><dt>绑定出口</dt><dd>${esc(n.exit||"未绑定")}</dd>
-<dt>出口 IP</dt><dd>${esc(n.ip||"—")}</dd><dt>最后在线</dt><dd>${ft(n.ip_ts)}</dd>
-<dt>上传</dt><dd>${fb(n.up)}</dd><dt>下载</dt><dd>${fb(n.down)}</dd><dt>合计</dt><dd><b>${fb(n.total)}</b></dd>
-<dt>统计起点</dt><dd>${ft(n.since)}</dd></dl>${(!n.online&&n.probe_err)?`<div class="m err">${esc(n.probe_err)}</div>`:""}
-<button class="d" type="button" data-reset="${esc(n.name)}">重置</button></section>`).join("")||"<p>没有节点</p>"}
-catch(e){document.getElementById("err").textContent="加载失败："+e}}
-document.getElementById("list").addEventListener("click",async e=>{const n=e.target.getAttribute("data-reset");if(!n)return;
-if(!confirm("确定把节点 "+n+" 的累计流量清零？"))return;await post("/api/reset",{node:n});load()});
-document.getElementById("refresh").onclick=load;
-document.getElementById("probe").onclick=async e=>{e.target.disabled=true;e.target.textContent="探测中…";
-await post("/api/probe",{});e.target.disabled=false;e.target.textContent="立即探测出口 IP";load()};
+function toast(m,k){const e=document.createElement("div");e.className="toast "+(k||"");e.textContent=m;$("toasts").appendChild(e);setTimeout(()=>e.remove(),k=="bad"?7000:3500)}
+function fail(msg,out){$("outMsg").textContent=msg;$("outTxt").textContent=out||"";$("outTxt").hidden=!out;$("dOut").showModal()}
+async function post(u,body){const r=await fetch(P+u,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":C},body:new URLSearchParams(body||{})});
+if(r.status==401){location.href=P+"/";throw new Error("登录已过期")}let j={};try{j=await r.json()}catch(e){}if(!r.ok||!j.ok){const e=new Error(j.error||("HTTP "+r.status));e.out=j.output||"";throw e}return j}
+function spark(h){if(!h||h.length<2)return"";const m=Math.max(1,...h),w=100/(h.length-1);return`<svg class="spark" viewBox="0 0 100 34" preserveAspectRatio="none" aria-hidden="true"><path d="${h.map((v,i)=>(i?"L":"M")+(i*w).toFixed(1)+" "+(32-v/m*30).toFixed(1)).join(" ")}"/></svg>`}
+'''
+PAGE_MAIN += '''
+function render(d){D=d;busy=d.busy;
+$("ver").textContent="v"+d.version;
+const xs=d.xray_active?'<span class="pill on">xray 运行中</span>':'<span class="pill off">xray 未运行</span>';
+$("hinfo").innerHTML=`<span>A 机 <b class="mono">${esc(d.a_ip)}</b></span><span>反代口 ${esc(d.reverse_port)}</span><span>隧道连接 ${d.tunnels}</span>${xs}`;
+const e=$("err");if(d.error){e.style.display="block";e.textContent="⚠ 统计异常："+d.error}else e.style.display="none";
+const on=d.nodes.filter(n=>n.online).length,up=d.nodes.reduce((a,n)=>a+n.up,0),dn=d.nodes.reduce((a,n)=>a+n.down,0);
+$("sum").innerHTML=[["节点",d.nodes.length],["在线",on+" / "+d.nodes.length],["总上传",fb(up)],["总下载",fb(dn)],["总流量",fb(up+dn)]].map(x=>`<div class="card"><span class="mut">${x[0]}</span><b>${x[1]}</b></div>`).join("");
+const age=d.last_poll?d.now-d.last_poll:-1;
+$("meta").textContent=d.last_poll?("流量更新于 "+ago(d.last_poll)+"（每 "+d.poll+" 秒）"+(age>3*d.poll+5?" · 已停止更新！":"")):"尚未取到流量";
+const mx=Math.max(1,...d.nodes.map(n=>n.total));
+$("list").innerHTML=d.nodes.map(n=>{const st=n.online?'<span class="pill on">在线</span>':(n.probe_ts?'<span class="pill off">离线</span>':'<span class="pill w">待探测</span>');
+return`<section class="card node"><h2><span>${esc(n.name)}</span>${st}</h2><dl class="kv">
+<dt>出口 IP</dt><dd class="mono">${esc(n.ip||"—")}</dd><dt>最后探测</dt><dd>${ago(n.probe_ts)}${n.ip_ts&&!n.online?" · 上次在线 "+ago(n.ip_ts):""}</dd>
+<dt>入口</dt><dd>${esc(n.port)} · ${esc(n.sni)}</dd><dt>出口绑定</dt><dd>${esc(n.exit||"未绑定")}${n.shared?" ⚠ 共用":""}</dd></dl>
+${(!n.online&&n.probe_err)?`<div class="err" style="font-size:13px">${esc(n.probe_err)}</div>`:""}
+<div class="tr"><div><small>↑ 上传</small><b>${fb(n.up)}</b><small>${fb(n.rate_up)}/s</small></div><div><small>↓ 下载</small><b>${fb(n.down)}</b><small>${fb(n.rate_down)}/s</small></div></div>
+<div class="barw" title="占全部节点最大值的比例"><div class="bar" style="width:${(n.total/mx*100).toFixed(1)}%"></div></div>
+<div class="mut" style="font-size:12px">合计 ${fb(n.total)} · 自 ${ago(n.since)}</div>${spark(n.hist)}
+<div class="nact">${d.manage?`<button class="btn s" data-a="link" data-n="${esc(n.name)}" type="button">查看链接 / 出口命令</button>`:""}
+<button class="btn s" data-a="probe" data-n="${esc(n.name)}" type="button">探测</button>
+<button class="btn s" data-a="reset" data-n="${esc(n.name)}" type="button">清零</button>
+${d.manage?`<button class="btn s d" data-a="del" data-n="${esc(n.name)}" type="button">删除</button>`:""}</div></section>`}).join("")||'<div class="card empty mut">还没有节点</div>';
+$("bAdd").hidden=!d.manage;$("bAdd").disabled=busy}
+async function load(){try{const r=await fetch(P+"/api/status",{cache:"no-store"});if(r.status==401){location.href=P+"/";return}render(await r.json())}catch(e){toast("加载失败："+e.message,"bad")}}
+function cp(t,b){(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>toast("已复制","ok"),()=>{const a=document.createElement("textarea");a.value=t;document.body.appendChild(a);a.select();try{document.execCommand("copy");toast("已复制","ok")}catch(e){toast("复制失败，请手动选择","bad")}a.remove()})}
+function showRes(j,title){$("dResH").textContent=title;$("resB").innerHTML=`<label>客户端分享链接（导入后核对 flow=xtls-rprx-vision）</label><div class="copy"><span class="mono" id="rL"></span><button class="btn s" type="button" id="cL">复制</button></div>
+<label>到这个节点的出口机（B）上执行</label><div class="copy"><span class="mono" id="rC"></span><button class="btn s" type="button" id="cC">复制</button></div>
+<p class="err" style="font-size:13px">链接和命令含密钥，只在自己设备间使用。</p>`;$("rL").textContent=j.link;$("rC").textContent=j.exit_cmd;
+$("cL").onclick=()=>cp(j.link);$("cC").onclick=()=>cp(j.exit_cmd);$("dRes").showModal()}
+document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>b.closest("dialog").close());
+$("list").addEventListener("click",async e=>{const b=e.target.closest("button[data-a]");if(!b)return;const a=b.dataset.a,n=b.dataset.n;
+try{if(a=="link"){if(!confirm("显示节点 "+n+" 的分享链接和出口机命令？\\n含密钥，注意身边没人看屏幕。"))return;b.disabled=true;showRes(await post("/api/link",{node:n}),"节点 "+n)}
+else if(a=="probe"){b.disabled=true;b.textContent="探测中…";await post("/api/probe",{node:n});toast("已探测 "+n,"ok");load()}
+else if(a=="reset"){if(!confirm("把节点 "+n+" 的累计流量清零？"))return;await post("/api/reset",{node:n});toast("已清零","ok");load()}
+else if(a=="del"){$("delN").textContent=n;$("delIn").value="";$("delGo").disabled=true;$("fDel").dataset.n=n;$("dDel").showModal();$("delIn").focus()}}
+catch(x){fail(x.message,x.out)}finally{b.disabled=false}});
+$("delIn").oninput=()=>{$("delGo").disabled=$("delIn").value!==$("fDel").dataset.n};
+$("fDel").onsubmit=async ev=>{ev.preventDefault();const n=$("fDel").dataset.n;if($("delIn").value!==n)return;$("delGo").disabled=true;$("delGo").textContent="删除中…";
+try{await post("/api/del",{node:n,confirm:$("delIn").value});$("dDel").close();toast("节点 "+n+" 已删除","ok")}catch(x){$("dDel").close();fail("删除失败："+x.message,x.out)}
+finally{$("delGo").textContent="删除";load()}};
+$("aSni").innerHTML='<option value="">沿用主入口</option>'+SNIS.map(s=>`<option value="${esc(s[0])}">${esc(s[0])}（${esc(s[1])}）</option>`).join("")+'<option value="__c">自定义…</option>';
+$("aSni").onchange=()=>{$("aCustW").hidden=$("aSni").value!="__c"};
+$("bAdd").onclick=()=>{const m=D&&D.nodes[0];$("defPort").textContent=m?m.port:"";$("defSni").textContent=m?m.sni:"";$("fAdd").reset();$("aCustW").hidden=true;$("dAdd").showModal();$("aName").focus()};
+$("fAdd").onsubmit=async ev=>{ev.preventDefault();const name=$("aName").value.trim(),port=$("aPort").value.trim();let sni=$("aSni").value;if(sni=="__c")sni=$("aCust").value.trim();
+if(!/^[A-Za-z0-9_-]{1,32}$/.test(name)){toast("节点名只能用字母/数字/下划线/连字符，最多 32 位","bad");return}
+if(port&&!(/^[0-9]+$/.test(port)&&+port>=1&&+port<=65535)){toast("端口必须是 1-65535","bad");return}
+if(sni&&!/^[A-Za-z0-9.-]+$/.test(sni)){toast("域名格式不对","bad");return}
+$("aGo").disabled=true;$("aGo").textContent="添加中…（约 10 秒）";
+try{const j=await post("/api/add",{name,port,sni});$("dAdd").close();toast("节点 "+name+" 已添加","ok");showRes(j,"新节点 "+name+" 已添加")}
+catch(x){fail("添加失败："+x.message,x.out)}finally{$("aGo").disabled=false;$("aGo").textContent="添加";load()}};
+$("bRef").onclick=load;
+$("bProbe").onclick=async e=>{const b=e.target;b.disabled=true;b.textContent="探测中…";try{await post("/api/probe",{});toast("探测完成","ok")}catch(x){toast(x.message,"bad")}b.disabled=false;b.textContent="立即探测";load()};
 load();setInterval(load,12000);
 </script></body></html>'''
 
@@ -1944,12 +2101,15 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('Content-Security-Policy',
                          "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-                         "connect-src 'self'; form-action 'self'; frame-ancestors 'none'")
+                         "img-src data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'")
         for k, v in (extra or []):
             self.send_header(k, v)
         self.end_headers()
         if self.command != 'HEAD':
             self.wfile.write(b)
+
+    def jsend(self, code, obj):
+        return self.send(code, json.dumps(obj, ensure_ascii=False), 'application/json; charset=utf-8')
 
     def redirect(self, to, extra=None):
         self.send(303, '', extra=[('Location', to)] + (extra or []))
@@ -1980,6 +2140,10 @@ class H(http.server.BaseHTTPRequestHandler):
             return None
         return p[len(PREFIX):] or '/'
 
+    def login_page(self, code, msg=''):
+        e = '<p class="err">%s</p>' % msg if msg else ''
+        return self.send(code, PAGE_LOGIN.replace('{CSS}', CSS).replace('{P}', PREFIX).replace('{E}', e))
+
     def do_HEAD(self):
         self.do_GET()
 
@@ -1990,14 +2154,16 @@ class H(http.server.BaseHTTPRequestHandler):
         sid, s = self.session()
         if r == '/':
             if not s:
-                return self.send(200, PAGE_LOGIN.replace('{P}', PREFIX).replace('{E}', ''))
-            return self.send(200, PAGE_MAIN.replace('{P}', PREFIX).replace('{C}', s['csrf']))
+                return self.login_page(200)
+            page = (PAGE_MAIN.replace('{CSS}', CSS).replace('{P}', PREFIX).replace('{C}', s['csrf'])
+                    .replace('{SNIS}', json.dumps(SNI_PRESETS, ensure_ascii=False)))
+            return self.send(200, page)
         if r == '/api/status':
             if not s:
-                return self.send(401, '{"error":"unauthorized"}', 'application/json')
-            return self.send(200, json.dumps(status_json(), ensure_ascii=False),
-                             'application/json; charset=utf-8')
+                return self.jsend(401, {'error': 'unauthorized'})
+            return self.jsend(200, status_json())
         return self.send(404, 'Not Found', 'text/plain')
+
     def do_POST(self):
         r = self.route()
         if r is None:
@@ -2005,8 +2171,7 @@ class H(http.server.BaseHTTPRequestHandler):
         ip = self.client_address[0]
         if r == '/login':
             if rate_limited(ip):
-                return self.send(429, PAGE_LOGIN.replace('{P}', PREFIX).replace(
-                    '{E}', '<p class="e">失败次数过多，请 10 分钟后再试</p>'))
+                return self.login_page(429, '失败次数过多，请 10 分钟后再试')
             f = self.form()
             if hmac.compare_digest(f.get('password', '').encode(), PASS.encode()):
                 sid = new_session()
@@ -2015,40 +2180,82 @@ class H(http.server.BaseHTTPRequestHandler):
                 return self.redirect(PREFIX + '/', [('Set-Cookie', ck)])
             note_fail(ip)
             time.sleep(1)
-            return self.send(401, PAGE_LOGIN.replace('{P}', PREFIX).replace(
-                '{E}', '<p class="e">密码错误</p>'))
+            return self.login_page(401, '密码错误')
         sid, s = self.session()
         if not s:
-            return self.send(401, '{"error":"unauthorized"}', 'application/json')
+            return self.jsend(401, {'error': 'unauthorized'})
         f = self.form()
         tok = self.headers.get('X-CSRF-Token') or f.get('csrf', '')
         if not hmac.compare_digest(tok.encode(), s['csrf'].encode()):
-            return self.send(403, '{"error":"csrf"}', 'application/json')
+            return self.jsend(403, {'error': 'CSRF 校验失败，请刷新页面'})
         if r == '/logout':
             with lock:
                 sessions.pop(sid, None)
             ck = 'att_sid=; Path=%s; HttpOnly; SameSite=Strict; Max-Age=0' % PREFIX
             return self.redirect(PREFIX + '/', [('Set-Cookie', ck)])
+        n = f.get('node', '')
+        if r in ('/api/reset', '/api/link', '/api/del') and n not in node_names():
+            return self.jsend(404, {'error': '节点 %s 不存在' % n})
         if r == '/api/reset':
-            n = f.get('node', '')
-            try:
-                names = {x['name'] for x in read_cfg()['nodes']}
-            except Exception:
-                names = set()
-            if n not in names:
-                return self.send(404, '{"error":"no such node"}', 'application/json')
             with lock:
                 rec = node_rec(n)
                 rec['up'] = rec['down'] = 0
+                rec['hist'] = []
                 rec['since'] = now()
-            save_state()
-            return self.send(200, '{"ok":true}', 'application/json')
+            safe_save()
+            return self.jsend(200, {'ok': True})
         if r == '/api/probe':
-            probe_all(f.get('node') or None)
-            return self.send(200, '{"ok":true}', 'application/json')
+            probe_all(n or None)
+            return self.jsend(200, {'ok': True})
+        if r in ('/api/link', '/api/add', '/api/del') and not os.path.isfile(SCRIPT):
+            return self.jsend(501, {'error': '面板未开启节点管理：请在 A 机重跑一次 --web'})
+        if r == '/api/link':
+            try:
+                return self.jsend(200, dict(node_link(n), ok=True))
+            except Exception as e:
+                return self.jsend(500, {'error': '取链接失败', 'output': str(e)})
+        if r == '/api/add':
+            return self.do_add(f)
+        if r == '/api/del':
+            if f.get('confirm') != n:
+                return self.jsend(400, {'error': '确认名称不一致'})
+            if not mut_lock.acquire(blocking=False):
+                return self.jsend(409, {'error': '另一个加/删操作正在进行，请稍后'})
+            try:
+                rc, out = run_script(['--del', n], {'ATT_YES': '1'})
+                after_change()
+            finally:
+                mut_lock.release()
+            if rc != 0:
+                return self.jsend(500, {'error': '脚本返回 %d（配置未改动或已回滚）' % rc, 'output': out})
+            return self.jsend(200, {'ok': True, 'output': out})
         return self.send(404, 'Not Found', 'text/plain')
 
-
+    def do_add(self, f):
+        name, port, sni = f.get('name', '').strip(), f.get('port', '').strip(), f.get('sni', '').strip()
+        if not NAME_RE.match(name):
+            return self.jsend(400, {'error': '节点名只能用字母/数字/下划线/连字符，最多 32 位'})
+        if port and not (port.isdigit() and 1 <= int(port) <= 65535):
+            return self.jsend(400, {'error': '端口必须是 1-65535'})
+        if sni and not SNI_RE.match(sni):
+            return self.jsend(400, {'error': '伪装域名格式不对'})
+        if name in node_names():
+            return self.jsend(409, {'error': '节点 %s 已存在' % name})
+        if not mut_lock.acquire(blocking=False):
+            return self.jsend(409, {'error': '另一个加/删操作正在进行，请稍后'})
+        try:
+            env = {'ATT_NODE_PORT': port, 'ATT_NODE_SNI': sni}
+            rc, out = run_script(['--add', name], env, timeout=240)
+            after_change(name)
+        finally:
+            mut_lock.release()
+        if rc != 0:
+            return self.jsend(500, {'error': '脚本返回 %d（配置未改动或已回滚）' % rc, 'output': out})
+        try:
+            return self.jsend(200, dict(node_link(name), ok=True, output=out))
+        except Exception as e:
+            return self.jsend(200, {'ok': True, 'output': out, 'link': '（取链接失败：%s）' % e,
+                                    'exit_cmd': ''})
 
 
 class Srv(http.server.ThreadingHTTPServer):
@@ -2068,6 +2275,13 @@ if __name__ == '__main__':
     main()
 ATT_WEB_PY
   sed -i "s/ATT_VERSION/$VERSION/g" "$WEB_PY.tmp"
+  # 伪装域名预置列表和脚本同源（面板「添加节点」下拉框用）
+  ATT_SNIS="$(printf '%s\n' "${CANDIDATES_WITH_COUNTRY[@]}")" python3 - "$WEB_PY.tmp" <<'PY' || { rm -f "$WEB_PY.tmp"; die "面板程序生成失败"; }
+import json,os,sys
+f=sys.argv[1]; s=open(f).read()
+l=[x.split('|',1) for x in os.environ['ATT_SNIS'].splitlines() if '|' in x]
+open(f,'w').write(s.replace('"ATT_SNI_PRESETS"', json.dumps(l, ensure_ascii=False), 1))
+PY
   python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$WEB_PY.tmp" 2>/dev/null || { rm -f "$WEB_PY.tmp"; die "面板程序生成失败（python3 语法检查不通过）"; }
   chmod 700 "$WEB_PY.tmp"; mv "$WEB_PY.tmp" "$WEB_PY"
 }
