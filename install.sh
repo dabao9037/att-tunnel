@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -756,7 +756,8 @@ for r in d.get('routing',{}).get('rules',[]):
         for u in r.get('user',[]):
             node2portal[u]=ot
 for ib in d.get('inbounds',[]):
-    if ib.get('tag')=='user-in':
+    # user-in = 主入口；user-in-<端口> = 加节点时指定了别的端口/伪装域名生成的独立入口
+    if ib.get('tag')=='user-in' or str(ib.get('tag','')).startswith('user-in-'):
         for c in ib.get('settings',{}).get('clients',[]):
             n=c.get('email','node')
             p=node2portal.get(n,'')
@@ -794,10 +795,17 @@ for t in dup:
     err.append('portal 标签重复: %s（流量会在多条隧道间随机派发）'%t)
 
 nodes=[]
+ports={}
 for ib in d.get('inbounds',[]):
-    if ib.get('tag')=='user-in':
+    if ib.get('tag')=='user-in' or str(ib.get('tag','')).startswith('user-in-'):
+        p=ib.get('port')
+        if p in ports:
+            err.append('入口端口 %s 被 %s 和 %s 重复使用'%(p,ports[p],ib.get('tag')))
+        ports[p]=ib.get('tag')
         for c in ib.get('settings',{}).get('clients',[]):
             nodes.append(c.get('email','node'))
+for n in sorted({n for n in nodes if nodes.count(n)>1}):
+    err.append('节点名重复: %s'%n)
 
 node2portal={}
 probe2portal={}
@@ -1351,7 +1359,7 @@ rules=d.setdefault('routing',{}).setdefault('rules',[])
 def is_probe(r): return 'probe-in' in (r.get('inboundTag') or [])
 nodes=[]
 for ib in ibs:
-    if ib.get('tag')=='user-in':
+    if ib.get('tag')=='user-in' or str(ib.get('tag','')).startswith('user-in-'):
         for i,c in enumerate(ib.get('settings',{}).get('clients',[])):
             if not c.get('email'):
                 c['email']='node' if i==0 else 'node%d'%(i+1)
@@ -1433,44 +1441,64 @@ write_web_py(){
   mkdir -p "$WEB_DIR"
   cat > "$WEB_PY.tmp" <<'ATT_WEB_PY'
 #!/usr/bin/env python3
-# att-tunnel 流量面板：只用 Python 标准库。
-# 数据来源：Xray StatsService（每 60s 带 -reset 拉一次，累加进本地 JSON，xray 重启也不丢总量）
-# 出口 IP：经本机 127.0.0.1 的 probe-in（socks5+密码）按节点走 portal-<节点>，访问 api.ipify.org
-# 安全：随机端口 + 随机路径前缀 + 登录密码（root 600 文件）；会话 Cookie HttpOnly/SameSite=Strict；
-#       重置/探测需 CSRF token；登录失败限速。面板绝不返回 vless 链接或 UUID。
+# att-tunnel 网页面板 vATT_VERSION：只用 Python 标准库，无外部 CDN。
+# 流量：每 POLL 秒读一次 Xray StatsService 的累计计数（不 -reset），按差值累加进本地 JSON。
+#   每个节点两路计数取大者：客户端计数 user>>>节点 和 出口隧道计数 user>>>exit.<portal>
+#   （出口隧道计数扣掉探测流量；多节点共用 portal 的旧结构只用客户端计数）。
+# 出口 IP：经 127.0.0.1 的 probe-in（socks5+密码）按节点走 portal-<节点>，访问 api.ipify.org。
+# 加/删节点：调用本机脚本副本 att-tunnel.sh --add/--del（同一套配置逻辑、校验和回滚），不在这里改配置。
+# 安全：随机端口 + 随机路径 + 密码；Cookie HttpOnly/SameSite=Strict；所有 POST 需会话 + CSRF；
+#       登录失败限速；分享链接/UUID 只在「查看链接」时按需返回，状态接口里没有。
 import hmac
 import http.cookies
 import http.server
 import ipaddress
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 
+VERSION = 'ATT_VERSION'
 CFG = os.environ.get('ATT_CFG', '/usr/local/etc/att-tunnel/config.json')
 ENVF = os.environ.get('ATT_WEB_ENV', '/etc/att-tunnel/web.env')
+AENV = os.environ.get('ATT_A_ENV', '/etc/att-tunnel/a.env')
 STATEF = os.environ.get('ATT_WEB_STATE', '/var/lib/att-tunnel/web-state.json')
 XRAY = os.environ.get('ATT_XRAY', '/usr/local/bin/xray')
-POLL = int(os.environ.get('ATT_POLL', '60'))
+SCRIPT = os.environ.get('ATT_SCRIPT', '/usr/local/lib/att-tunnel/att-tunnel.sh')
+SVC = os.environ.get('ATT_SVC', 'att-tunnel')
+POLL = int(os.environ.get('ATT_POLL', '10'))
 PROBE_EVERY = int(os.environ.get('ATT_PROBE_EVERY', '300'))
+HIST_MAX = 90           # 每节点保留最近 90 个采样点（默认 10s 一个 = 15 分钟）
 SESSION_TTL = 12 * 3600
 IP_SOURCES = [('api.ipify.org', '/'), ('icanhazip.com', '/'), ('ifconfig.me', '/ip')]
+NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,32}$')     # 与脚本 add_node 同一规则
+SNI_RE = re.compile(r'^[A-Za-z0-9.-]{1,253}$')
+ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+
+
+def log(*a):
+    print(time.strftime('%F %T'), *a, file=sys.stderr, flush=True)
 
 
 def load_env(path):
     env = {}
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            k, v = line.split('=', 1)
-            env[k.strip()] = v.strip().strip('"').strip("'")
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
     return env
 
 
@@ -1479,12 +1507,15 @@ PORT = int(ENV['WEB_PORT'])
 PREFIX = '/' + ENV['WEB_PATH'].strip('/')
 PASS = ENV['WEB_PASS']
 LISTEN = ENV.get('WEB_LISTEN', '0.0.0.0')
+RAW_URL = ENV.get('WEB_RAW_URL', '')
 if len(PASS) < 8 or PREFIX == '/':
     sys.exit('web.env 不完整：WEB_PASS 至少 8 位，WEB_PATH 不能为空')
 
 lock = threading.RLock()
+save_lock = threading.Lock()
 probe_lock = threading.Lock()
-state = {'nodes': {}, 'last_poll': 0, 'poll_err': ''}
+mut_lock = threading.Lock()      # 加/删节点串行（脚本里还有一把 flock）
+state = {'nodes': {}, 'raw': {}, 'last_poll': 0, 'poll_err': '', 'started': 0}
 
 
 def now():
@@ -1497,37 +1528,58 @@ def load_state():
         with open(STATEF) as f:
             s = json.load(f)
         if isinstance(s, dict) and isinstance(s.get('nodes'), dict):
-            state = s
+            s.setdefault('raw', {})
+            # v2.1.0 每次都 -reset，它留下的计数基线没有意义
+            if s.get('ver') != 2:
+                s['raw'] = {}
+            state.update(s)
     except Exception:
         pass
+    state['ver'] = 2
 
 
 def save_state():
-    # 原子写：先写临时文件再 rename，断电/崩溃不会留下半截 JSON
-    d = os.path.dirname(STATEF)
-    os.makedirs(d, mode=0o700, exist_ok=True)
-    tmp = '%s.tmp.%d' % (STATEF, os.getpid())
-    with lock:
-        data = json.dumps(state, ensure_ascii=False)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w') as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, STATEF)
+    # v2.1.0 的 bug：多线程共用一个临时文件名，并发保存会抛 FileNotFoundError，
+    # 而轮询线程没接住这个异常 -> 统计线程静默退出，流量从此不再增长。
+    # 现在：串行保存 + 每线程独立临时名 + 调用方全部 try 住。
+    with save_lock:
+        d = os.path.dirname(STATEF)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        tmp = '%s.tmp.%d.%d' % (STATEF, os.getpid(), threading.get_ident())
+        with lock:
+            data = json.dumps(state, ensure_ascii=False)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATEF)
+
+
+def safe_save():
+    try:
+        save_state()
+    except Exception as e:
+        log('保存状态失败:', e)
+
+
+def is_user_in(ib):
+    t = str(ib.get('tag', ''))
+    return t == 'user-in' or t.startswith('user-in-')
 
 
 def read_cfg():
-    """从 config.json 读节点表：名称、入口端口、绑定出口、探测账号、API 地址。"""
+    """从 config.json 读节点表：名称、入口端口、伪装域名、绑定出口、探测账号、API 地址。"""
     with open(CFG) as f:
         d = json.load(f)
     api = (d.get('api') or {}).get('listen', '')
-    nodes, uport, probe_port, probe_acc = [], None, None, {}
+    nodes, probe_port, probe_acc = [], None, {}
     for ib in d.get('inbounds', []):
-        if ib.get('tag') == 'user-in':
-            uport = ib.get('port')
+        if is_user_in(ib):
+            rs = (ib.get('streamSettings') or {}).get('realitySettings') or {}
+            sni = (rs.get('serverNames') or [''])[0]
             for c in ib.get('settings', {}).get('clients', []):
-                nodes.append(c.get('email', 'node'))
+                nodes.append((c.get('email', 'node'), ib.get('port'), sni))
         elif ib.get('tag') == 'probe-in':
             probe_port = ib.get('port')
             for a in ib.get('settings', {}).get('accounts', []):
@@ -1538,9 +1590,15 @@ def read_cfg():
         if ot.startswith('portal') and 'probe-in' not in (r.get('inboundTag') or []):
             for u in r.get('user', []):
                 portal[u] = ot
+    use = {}
+    for n, _, _ in nodes:
+        if portal.get(n):
+            use[portal[n]] = use.get(portal[n], 0) + 1
     out = []
-    for n in nodes:
-        out.append({'name': n, 'port': uport, 'exit': portal.get(n, ''),
+    for n, port, sni in nodes:
+        ex = portal.get(n, '')
+        out.append({'name': n, 'port': port, 'sni': sni, 'exit': ex,
+                    'shared': use.get(ex, 0) > 1,
                     'probe_user': 'probe-' + n,
                     'probe_pass': probe_acc.get('probe-' + n, '')})
     return {'api': api, 'probe_port': probe_port, 'nodes': out}
@@ -1548,52 +1606,89 @@ def read_cfg():
 
 def node_rec(name):
     with lock:
-        return state['nodes'].setdefault(name, {
-            'up': 0, 'down': 0, 'since': now(), 'ip': '', 'ip_ts': 0,
-            'probe_ok': False, 'probe_ts': 0, 'probe_err': ''})
+        r = state['nodes'].setdefault(name, {})
+        for k, v in (('up', 0), ('down', 0), ('since', now()), ('ip', ''), ('ip_ts', 0),
+                     ('probe_ok', False), ('probe_ts', 0), ('probe_err', ''), ('hist', []),
+                     ('rate_up', 0), ('rate_down', 0), ('cnt_user', 0), ('cnt_exit', 0)):
+            r.setdefault(k, v)
+        return r
 
 
-def statsquery(api, pattern, reset=True):
-    cmd = [XRAY, 'api', 'statsquery', '--server=' + api, '-pattern', pattern]
-    if reset:
-        cmd.append('-reset')
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+def statsquery(api):
+    """读全部累计计数（不清零）。返回 {计数器名: 值}。值为 0 的计数器 Xray 不输出 value 字段。"""
+    p = subprocess.run([XRAY, 'api', 'statsquery', '--server=' + api],
+                       capture_output=True, text=True, timeout=15)
     if p.returncode != 0:
-        raise RuntimeError((p.stderr or p.stdout).strip()[-200:] or 'statsquery 失败')
+        raise RuntimeError('xray api statsquery 失败：' +
+                           ((p.stderr or p.stdout).strip()[-200:] or 'rc=%d' % p.returncode))
     txt = p.stdout.strip()
     if not txt:
-        return []
-    return (json.loads(txt).get('stat') or [])
+        return {}
+    return {s.get('name', ''): int(s.get('value') or 0) for s in (json.loads(txt).get('stat') or [])}
+
+
+def svc_info(name):
+    """(是否 active, 进入 active 的单调时间戳)。时间戳变了 = xray 重启过，计数器已归零。"""
+    try:
+        p = subprocess.run(['systemctl', 'show', name, '-p', 'ActiveState',
+                            '-p', 'ActiveEnterTimestampMonotonic', '-p', 'ActiveEnterTimestamp'],
+                           capture_output=True, text=True, timeout=5)
+        kv = dict(l.split('=', 1) for l in p.stdout.splitlines() if '=' in l)
+        return (kv.get('ActiveState') == 'active', kv.get('ActiveEnterTimestampMonotonic', ''),
+                kv.get('ActiveEnterTimestamp', ''))
+    except Exception:
+        return (False, '', '')
 
 
 def poll_stats():
-    """拉取 user>>>节点>>>traffic>>>uplink/downlink 并清零，累加进本地状态。"""
+    """读累计计数，按差值累加。xray 重启（计数归零）靠 systemd 的启动时间戳识别。"""
     try:
         c = read_cfg()
         if not c['api']:
-            raise RuntimeError('config.json 没有 api 段，请先在脚本里启用统计')
-        names = {n['name'] for n in c['nodes']}
-        stats = statsquery(c['api'], 'user>>>')
+            raise RuntimeError('config.json 没有 api 段：请重跑 --web（会自动启用统计并重启 xray）')
+        active, mono, since = svc_info(SVC)
         with lock:
-            for s in stats:
-                parts = s.get('name', '').split('>>>')
-                if len(parts) != 4 or parts[0] != 'user' or parts[2] != 'traffic':
-                    continue
-                n, direction = parts[1], parts[3]
-                if n not in names:
-                    continue  # probe-<节点> 的探测流量不计入
-                v = int(s.get('value') or 0)
-                r = node_rec(n)
-                if direction == 'uplink':
-                    r['up'] += v
-                elif direction == 'downlink':
-                    r['down'] += v
-            state['last_poll'] = now()
+            state['xray_active'], state['xray_since'] = active, since
+        if not active:
+            raise RuntimeError('%s 服务未运行，读不到流量计数' % SVC)
+        cur = statsquery(c['api'])
+        t = now()
+        with lock:
+            if state.get('xray_mono') != mono:
+                state['raw'] = {}          # xray 重启过：新计数从 0 开始
+                state['xray_mono'] = mono
+            raw = state['raw']
+            dl = {k: (v - raw[k] if k in raw and v >= raw[k] else v) for k, v in cur.items()}
+            state['raw'] = cur
+            dt = max(1, t - (state.get('last_poll') or t - POLL))
+            for n in c['nodes']:
+                name, ex = n['name'], n['exit']
+                r = node_rec(name)
+                u_up = dl.get('user>>>%s>>>traffic>>>uplink' % name, 0)
+                u_dn = dl.get('user>>>%s>>>traffic>>>downlink' % name, 0)
+                e_up = e_dn = 0
+                if ex and not n['shared']:
+                    # 出口隧道的方向与客户端相反：B->A(uplink) 就是用户下载
+                    p_up = dl.get('user>>>probe-%s>>>traffic>>>uplink' % name, 0)
+                    p_dn = dl.get('user>>>probe-%s>>>traffic>>>downlink' % name, 0)
+                    e_dn = max(0, dl.get('user>>>exit.%s>>>traffic>>>uplink' % ex, 0) - p_dn)
+                    e_up = max(0, dl.get('user>>>exit.%s>>>traffic>>>downlink' % ex, 0) - p_up)
+                up, dn = max(u_up, e_up), max(u_dn, e_dn)
+                r['up'] += up
+                r['down'] += dn
+                r['cnt_user'] += u_up + u_dn
+                r['cnt_exit'] += e_up + e_dn
+                r['rate_up'], r['rate_down'] = up // dt, dn // dt
+                r['hist'] = (r['hist'] + [[t, up, dn]])[-HIST_MAX:]
+            state['last_poll'] = t
             state['poll_err'] = ''
     except Exception as e:
         with lock:
-            state['poll_err'] = str(e)[:200]
-    save_state()
+            state['poll_err'] = str(e)[:300]
+        log('统计轮询失败:', e)
+    safe_save()
+
+
 def recv_exact(s, n):
     b = b''
     while len(b) < n:
@@ -1604,7 +1699,7 @@ def recv_exact(s, n):
     return b
 
 
-def socks5_get(port, user, pw, host, path, timeout=15):
+def socks5_get(port, user, pw, host, path, timeout=12):
     """标准库 socks5（RFC1928/1929 密码认证）+ 明文 HTTP GET，返回响应体。"""
     s = socket.create_connection(('127.0.0.1', port), timeout=timeout)
     try:
@@ -1641,16 +1736,17 @@ def socks5_get(port, user, pw, host, path, timeout=15):
     head, _, body = buf.partition(b'\r\n\r\n')
     status = head.split(b'\r\n', 1)[0]
     if b' 200' not in status:
-        raise RuntimeError('HTTP ' + status.decode('latin1')[:40])
+        raise RuntimeError('HTTP ' + status.decode('latin1')[:40] if status else '出口无响应（隧道未连上？）')
     return body.decode('latin1').strip()
 
 
 def probe_node(n, probe_port):
     r = node_rec(n['name'])
-    err = ''
-    ip = ''
+    err, ip = '', ''
     if not probe_port or not n['probe_pass']:
-        err = '未配置探测账号'
+        err = '未配置探测账号（重跑 --web）'
+    elif not n['exit']:
+        err = '节点没绑定出口机'
     else:
         for host, path in IP_SOURCES:
             try:
@@ -1667,9 +1763,9 @@ def probe_node(n, probe_port):
             r['probe_ok'], r['probe_err'] = False, err
 
 
-def probe_all(only=None):
-    if not probe_lock.acquire(blocking=False):
-        return  # 已有一轮在跑
+def probe_all(only=None, wait=True):
+    if not probe_lock.acquire(blocking=wait):
+        return False  # 已有一轮在跑
     try:
         c = read_cfg()
         ths = []
@@ -1681,21 +1777,42 @@ def probe_all(only=None):
             ths.append(t)
         for t in ths:
             t.join(60)
-    except Exception:
-        pass
+    except Exception as e:
+        log('探测失败:', e)
     finally:
         probe_lock.release()
-    save_state()
+    safe_save()
+    return True
 
 
 def worker():
     last_probe = 0
     while True:
-        poll_stats()
-        if time.time() - last_probe >= PROBE_EVERY:
-            last_probe = time.time()
-            threading.Thread(target=probe_all, daemon=True).start()
+        # 任何异常都不能让这个线程退出（v2.1.0 就是线程静默死掉，流量永远不再增长）
+        try:
+            poll_stats()
+            if time.time() - last_probe >= PROBE_EVERY:
+                last_probe = time.time()
+                threading.Thread(target=probe_all, kwargs={'wait': False}, daemon=True).start()
+        except Exception:
+            log('worker 异常:', traceback.format_exc())
         time.sleep(POLL)
+
+
+def tunnel_count(port):
+    """数 reverse-in 端口上的 ESTABLISHED 连接（= 已连上的出口机隧道数）。"""
+    n = 0
+    for fn in ('/proc/net/tcp', '/proc/net/tcp6'):
+        try:
+            with open(fn) as f:
+                next(f)
+                for line in f:
+                    p = line.split()
+                    if p[3] == '01' and int(p[1].rsplit(':', 1)[1], 16) == port:
+                        n += 1
+        except Exception:
+            pass
+    return n
 
 
 def status_json():
@@ -1703,20 +1820,31 @@ def status_json():
         c = read_cfg()
         cfg_err = ''
     except Exception as e:
-        c, cfg_err = {'nodes': []}, str(e)[:200]
+        c, cfg_err = {'nodes': []}, '读配置失败：' + str(e)[:200]
+    a = load_env(AENV)
     t = now()
     out = []
     with lock:
         for n in c['nodes']:
             r = node_rec(n['name'])
-            online = bool(r['probe_ok'] and t - r['probe_ts'] <= PROBE_EVERY + POLL + 30)
-            out.append({'name': n['name'], 'port': n['port'], 'exit': n['exit'],
-                        'online': online, 'ip': r['ip'], 'ip_ts': r['ip_ts'],
+            online = bool(r['probe_ok'] and t - r['probe_ts'] <= PROBE_EVERY + 2 * POLL + 60)
+            out.append({'name': n['name'], 'port': n['port'], 'sni': n['sni'], 'exit': n['exit'],
+                        'shared': n['shared'], 'online': online, 'ip': r['ip'], 'ip_ts': r['ip_ts'],
                         'probe_ts': r['probe_ts'], 'probe_err': r['probe_err'],
                         'up': r['up'], 'down': r['down'], 'total': r['up'] + r['down'],
-                        'since': r['since']})
-        return {'now': t, 'last_poll': state['last_poll'],
-                'error': cfg_err or state['poll_err'], 'nodes': out}
+                        'rate_up': r['rate_up'], 'rate_down': r['rate_down'],
+                        'hist': [h[1] + h[2] for h in r['hist'][-40:]],
+                        'src_user': r['cnt_user'], 'src_exit': r['cnt_exit'], 'since': r['since']})
+        rp = a.get('REVERSE_PORT', '')
+        return {'now': t, 'version': VERSION, 'a_ip': a.get('A_IP', ''),
+                'reverse_port': rp, 'tunnels': tunnel_count(int(rp)) if rp.isdigit() else 0,
+                'xray_active': state.get('xray_active', False), 'xray_since': state.get('xray_since', ''),
+                'last_poll': state['last_poll'], 'poll': POLL, 'probe_every': PROBE_EVERY,
+                'error': cfg_err or state['poll_err'], 'nodes': out, 'busy': mut_lock.locked(), 'manage': False}
+
+
+
+
 sessions = {}   # sid -> {'exp': ts, 'csrf': token}
 fails = {}      # ip -> [失败时间戳]
 FAIL_WIN, FAIL_MAX = 600, 5
@@ -1765,7 +1893,7 @@ button.p{background:#2563eb;color:#fff;border:0}button.d{color:#b91c1c;border-co
 .card{background:#fff;border-radius:12px;padding:14px;box-shadow:0 1px 6px #0001}
 .card h2{font-size:17px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:center}
 .on{color:#15803d}.off{color:#b91c1c}dl{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;margin:0 0 10px}
-dt{color:#666}dd{margin:0;word-break:break-all}.m{color:#666;font-size:13px}.err{color:#b91c1c}</style></head>
+dt{color:#666}dd{margin:0;word-break:break-all}.m{color:#666;font-size:13px}.err{color:#b91c1c}#err:not(:empty){background:#fee2e2;border:1px solid #fca5a5;padding:10px 14px;border-radius:10px;margin-bottom:12px;font-weight:600}</style></head>
 <body><h1>att-tunnel 流量面板</h1>
 <div class="bar"><button class="p" id="probe" type="button">立即探测出口 IP</button>
 <button id="refresh" type="button">刷新</button>
@@ -1779,8 +1907,8 @@ function ft(t){if(!t)return"从未";const d=new Date(t*1000);return d.toLocaleSt
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 async function post(u,body){const r=await fetch(P+u,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":C},body:new URLSearchParams(body)});if(r.status==401)location.href=P+"/";return r}
 async function load(){try{const r=await fetch(P+"/api/status",{cache:"no-store"});if(r.status==401){location.href=P+"/";return}
-const d=await r.json();document.getElementById("err").textContent=d.error?("统计异常："+d.error):"";
-document.getElementById("meta").textContent="流量更新于 "+ft(d.last_poll)+"（每 60 秒）";
+const d=await r.json();document.getElementById("err").textContent=d.error?("⚠ 统计异常："+d.error):"";
+document.getElementById("meta").textContent="流量更新于 "+ft(d.last_poll)+"（每 "+d.poll+" 秒）"+(d.last_poll&&d.now-d.last_poll>3*d.poll+5?" · 已停止更新！":"");
 document.getElementById("list").innerHTML=d.nodes.map(n=>`<section class="card"><h2><span>${esc(n.name)}</span>
 <span class="${n.online?"on":"off"}">${n.online?"● 在线":"● 离线"}</span></h2><dl>
 <dt>入口端口</dt><dd>${esc(n.port)}</dd><dt>绑定出口</dt><dd>${esc(n.exit||"未绑定")}</dd>
@@ -1794,8 +1922,10 @@ if(!confirm("确定把节点 "+n+" 的累计流量清零？"))return;await post(
 document.getElementById("refresh").onclick=load;
 document.getElementById("probe").onclick=async e=>{e.target.disabled=true;e.target.textContent="探测中…";
 await post("/api/probe",{});e.target.disabled=false;e.target.textContent="立即探测出口 IP";load()};
-load();setInterval(load,30000);
+load();setInterval(load,12000);
 </script></body></html>'''
+
+
 class H(http.server.BaseHTTPRequestHandler):
     server_version = 'att-web'
     sys_version = ''
@@ -1919,6 +2049,8 @@ class H(http.server.BaseHTTPRequestHandler):
         return self.send(404, 'Not Found', 'text/plain')
 
 
+
+
 class Srv(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1926,6 +2058,8 @@ class Srv(http.server.ThreadingHTTPServer):
 
 def main():
     load_state()
+    state['started'] = now()
+    log('att-tunnel 面板 v%s 启动，监听 %s:%d' % (VERSION, LISTEN, PORT))
     threading.Thread(target=worker, daemon=True).start()
     Srv((LISTEN, PORT), H).serve_forever()
 
@@ -1933,6 +2067,8 @@ def main():
 if __name__ == '__main__':
     main()
 ATT_WEB_PY
+  sed -i "s/ATT_VERSION/$VERSION/g" "$WEB_PY.tmp"
+  python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$WEB_PY.tmp" 2>/dev/null || { rm -f "$WEB_PY.tmp"; die "面板程序生成失败（python3 语法检查不通过）"; }
   chmod 700 "$WEB_PY.tmp"; mv "$WEB_PY.tmp" "$WEB_PY"
 }
 
