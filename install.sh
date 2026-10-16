@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -510,6 +510,12 @@ $a_extra_rule
 }
 EOF
 
+  # 流量统计 + 出口探测（API / probe-in 只听 127.0.0.1，不对外）
+  STATS_API_PORT=$(free_port)
+  PROBE_PORT=$(free_port)
+  while [ "$PROBE_PORT" = "$STATS_API_PORT" ]; do PROBE_PORT=$(free_port); done
+  stats_sync "$tmp" 1 || { rm -f "$tmp"; die "统计配置生成失败"; }
+
   apply_cfg "$tmp"
   harden_service
   tune_tcp
@@ -530,6 +536,8 @@ REALITY_PUB=$pub
 BRIDGE_UUID=$buuid
 VLESS_ENC=$enc
 REVERSE_STYLE=$REVERSE_STYLE
+STATS_API_PORT=$STATS_API_PORT
+PROBE_PORT=$PROBE_PORT
 EOF
   chmod 600 "$STATE/a.env"
 
@@ -743,7 +751,8 @@ for ib in d.get('inbounds',[]):
 node2portal={}
 for r in d.get('routing',{}).get('rules',[]):
     ot=r.get('outboundTag','')
-    if ot.startswith('portal'):
+    # probe-in 的探测规则（user=probe-<节点>）不是节点规则
+    if ot.startswith('portal') and 'probe-in' not in (r.get('inboundTag') or []):
         for u in r.get('user',[]):
             node2portal[u]=ot
 for ib in d.get('inbounds',[]):
@@ -791,8 +800,16 @@ for ib in d.get('inbounds',[]):
             nodes.append(c.get('email','node'))
 
 node2portal={}
+probe2portal={}
 for r in d.get('routing',{}).get('rules',[]):
     ot=r.get('outboundTag','')
+    # 按 inboundTag 区分：probe-in 的是出口探测规则（user=probe-<节点>），单独校验
+    if 'probe-in' in (r.get('inboundTag') or []):
+        if ot.startswith('portal') and ot not in bridge_tags:
+            err.append('探测路由指向不存在的 portal 标签: %s'%ot)
+        for u in r.get('user',[]):
+            probe2portal[u]=ot
+        continue
     if not ot.startswith('portal'):
         continue
     if ot not in bridge_tags:
@@ -805,6 +822,15 @@ for r in d.get('routing',{}).get('rules',[]):
 for n in nodes:
     if n not in node2portal:
         err.append('节点 %s 没绑定出口机（流量会从 A 直接出网，泄露 A 的 IP）'%n)
+
+# 启用了出口探测时：探测账号必须和节点一一对应，且探测走的出口必须等于节点的出口
+if any(ib.get('tag')=='probe-in' for ib in d.get('inbounds',[])):
+    for u,ot in probe2portal.items():
+        n=u[len('probe-'):] if u.startswith('probe-') else None
+        if n not in nodes:
+            err.append('探测路由里有悬空账号: %s'%u)
+        elif node2portal.get(n) and ot!=node2portal[n]:
+            err.append('节点 %s 的探测出口(%s)和节点出口(%s)不一致'%(n,ot,node2portal[n]))
 
 if err:
     for e in err:
@@ -860,6 +886,8 @@ PY
   if [ "$rc" != 0 ] || [ ! -s "$tmp" ]; then
     rm -f "$tmp"; die "升级失败：配置解析异常（原配置未改动）"
   fi
+  # 已启用统计时同步 email / 探测账号 / 探测路由（未启用则原样）
+  stats_sync "$tmp" 0 || { rm -f "$tmp"; die "统计/探测结构同步失败（原配置未改动）"; }
   local vmsg
   if ! vmsg=$(validate_cfg "$tmp"); then
     rm -f "$tmp"
@@ -1060,6 +1088,8 @@ PY
     rm -f "$tmp"
     die "节点名已存在或配置解析失败（原配置未改动）"
   fi
+  # 已启用统计时同步 email / 探测账号 / 探测路由（未启用则原样）
+  stats_sync "$tmp" 0 || { rm -f "$tmp"; die "统计/探测结构同步失败（原配置未改动）"; }
   local vmsg
   if ! vmsg=$(validate_cfg "$tmp"); then
     rm -f "$tmp"; echo "$vmsg" | sed 's/^/    /'
@@ -1186,7 +1216,7 @@ name=os.environ['DEL_NAME']
 ptags=set()
 for r in d.get('routing',{}).get('rules',[]):
     ot=r.get('outboundTag','')
-    if ot.startswith('portal') and name in r.get('user',[]):
+    if ot.startswith('portal') and name in r.get('user',[]) and 'probe-in' not in (r.get('inboundTag') or []):
         ptags.add(ot)
 
 found=False
@@ -1207,7 +1237,8 @@ if not found:
 still={}
 for r in d.get('routing',{}).get('rules',[]):
     ot=r.get('outboundTag','')
-    if ot.startswith('portal'):
+    # 探测规则（probe-in）不算“共用”，否则 probe-<节点> 会让 bridge 永远删不掉
+    if ot.startswith('portal') and 'probe-in' not in (r.get('inboundTag') or []):
         others=[u for u in r.get('user',[]) if u!=name]
         if others:
             still[ot]=others
@@ -1234,6 +1265,8 @@ PY
     rm -f "$tmp"
     die "删除失败：配置解析异常或节点已不存在（原配置未改动）"
   fi
+  # 已启用统计时同步 email / 探测账号 / 探测路由（未启用则原样）
+  stats_sync "$tmp" 0 || { rm -f "$tmp"; die "统计/探测结构同步失败（原配置未改动）"; }
   local vmsg
   if ! vmsg=$(validate_cfg "$tmp"); then
     rm -f "$tmp"; echo "$vmsg" | sed 's/^/    /'
@@ -1246,6 +1279,745 @@ PY
   echo
   info "剩下的节点："
   show_links
+}
+
+# ================= 流量统计 / 出口探测（A 端） =================
+# 设计：
+#   stats + api（只听 127.0.0.1:<随机口>）+ policy 打开按用户计流量。
+#   用户 client 的 email = 节点名 → 计数器 user>>>节点>>>traffic>>>uplink/downlink
+#   bridge client 的 email = exit.portal-<节点>（出口侧计数，方向相反，面板不用）
+#   probe-in：127.0.0.1 上的 socks（密码认证），每个节点一个账号 probe-<节点>，
+#   路由 user:[probe-<节点>] + inboundTag:[probe-in] -> portal-<节点>，
+#   面板经它访问 api.ipify.org，拿到的就是该节点出口机（B）的实时公网 IP。
+#   statsonlineiplist 对反向 bridge 拿不到 IP（已实测），所以只能这样探。
+#   probe-in 兜底规则 -> blackhole：探测账号万一没对上规则，宁可失败也不从 A 直出（否则会显示 A 的 IP）。
+# 分享链接、B 端配置都不变。
+
+# 是否已启用统计（config 里有 api 段 + probe-in 入站）
+stats_enabled(){
+  [ -f "$CFG" ] || return 1
+  ATT_CFG="$CFG" python3 - <<'PY'
+import json,os,sys
+d=json.load(open(os.environ['ATT_CFG']))
+ok=bool((d.get('api') or {}).get('listen')) and any(ib.get('tag')=='probe-in' for ib in d.get('inbounds',[]))
+sys.exit(0 if ok else 1)
+PY
+}
+
+# 统计/探测用的两个本地端口，存在 a.env 里（STATS_API_PORT / PROBE_PORT）
+ensure_stats_ports(){
+  # shellcheck disable=SC1090
+  source "$STATE/a.env"
+  if [ -z "${STATS_API_PORT:-}" ]; then
+    STATS_API_PORT=$(free_port); echo "STATS_API_PORT=$STATS_API_PORT" >> "$STATE/a.env"
+  fi
+  if [ -z "${PROBE_PORT:-}" ] || [ "$PROBE_PORT" = "$STATS_API_PORT" ]; then
+    PROBE_PORT=$(free_port)
+    while [ "$PROBE_PORT" = "$STATS_API_PORT" ]; do PROBE_PORT=$(free_port); done
+    sed -i '/^PROBE_PORT=/d' "$STATE/a.env"; echo "PROBE_PORT=$PROBE_PORT" >> "$STATE/a.env"
+  fi
+  chmod 600 "$STATE/a.env"
+}
+
+# 把统计/探测结构同步进配置文件 $1（原地改写，幂等）。
+#   $2=1：没启用也强制加上（部署 / 升级用）；$2=0：只在已启用时同步（加删节点 / 迁移用）
+# 同步内容：api/stats/policy、节点 email、bridge email、每节点一个探测账号 + 一条探测路由，
+# 删掉已不存在节点的探测账号/路由，探测路由的出口永远跟节点路由一致。
+stats_sync(){
+  local f="$1" force="${2:-0}" out rc=0
+  out=$(mktemp --suffix=.json)
+  ATT_CFG="$f" ATT_FORCE="$force" API_PORT="${STATS_API_PORT:-}" PRB_PORT="${PROBE_PORT:-}" \
+    python3 - > "$out" <<'PY' || rc=$?
+import json,os,secrets,sys
+d=json.load(open(os.environ['ATT_CFG']))
+ibs=d.setdefault('inbounds',[])
+has=bool((d.get('api') or {}).get('listen')) and any(ib.get('tag')=='probe-in' for ib in ibs)
+if not has and os.environ.get('ATT_FORCE')!='1':
+    print(json.dumps(d,indent=1)); sys.exit(0)
+ap=os.environ.get('API_PORT',''); pp=os.environ.get('PRB_PORT','')
+# 已启用时沿用配置里的端口，只有新增时才需要端口参数
+if not has and not (ap.isdigit() and pp.isdigit()):
+    raise SystemExit('NOPORT')
+if not (d.get('api') or {}).get('listen'):
+    d['api']={'tag':'api','listen':'127.0.0.1:%s'%ap,'services':['StatsService']}
+d.setdefault('stats',{})
+pol=d.setdefault('policy',{})
+lv=pol.setdefault('levels',{}).setdefault('0',{})
+lv['statsUserUplink']=True; lv['statsUserDownlink']=True
+sy=pol.setdefault('system',{})
+for k in ('statsInboundUplink','statsInboundDownlink','statsOutboundUplink','statsOutboundDownlink'):
+    sy[k]=True
+rules=d.setdefault('routing',{}).setdefault('rules',[])
+def is_probe(r): return 'probe-in' in (r.get('inboundTag') or [])
+nodes=[]
+for ib in ibs:
+    if ib.get('tag')=='user-in':
+        for i,c in enumerate(ib.get('settings',{}).get('clients',[])):
+            if not c.get('email'):
+                c['email']='node' if i==0 else 'node%d'%(i+1)
+            nodes.append(c['email'])
+for ib in ibs:
+    if ib.get('tag')=='reverse-in':
+        for c in ib.get('settings',{}).get('clients',[]):
+            t=(c.get('reverse') or {}).get('tag')
+            if t:
+                c['email']='exit.%s'%t
+n2p={}
+for r in rules:
+    ot=r.get('outboundTag','')
+    if ot.startswith('portal') and not is_probe(r):
+        for u in r.get('user',[]):
+            n2p.setdefault(u,ot)
+pin=[ib for ib in ibs if ib.get('tag')=='probe-in']
+if pin:
+    pin=pin[0]
+else:
+    pin={'tag':'probe-in','listen':'127.0.0.1','port':int(pp),'protocol':'socks',
+         'settings':{'auth':'password','accounts':[],'udp':False}}
+    ibs.append(pin)
+pin['listen']='127.0.0.1'
+st=pin.setdefault('settings',{}); st['auth']='password'; st['udp']=False
+old={a.get('user'):a.get('pass') for a in st.get('accounts',[]) if a.get('pass')}
+st['accounts']=[{'user':'probe-'+n,'pass':old.get('probe-'+n) or secrets.token_hex(16)} for n in nodes]
+if not st['accounts']:
+    raise SystemExit('NONODE')
+obs=d.setdefault('outbounds',[])
+if not any(o.get('tag')=='probe-block' for o in obs):
+    obs.append({'tag':'probe-block','protocol':'blackhole'})
+keep=[r for r in rules if not is_probe(r)]
+pr=[{'type':'field','inboundTag':['probe-in'],'user':['probe-'+n],'outboundTag':n2p[n]} for n in nodes if n in n2p]
+pr.append({'type':'field','inboundTag':['probe-in'],'outboundTag':'probe-block'})
+d['routing']['rules']=pr+keep
+print(json.dumps(d,indent=1))
+PY
+  if [ "$rc" != 0 ] || [ ! -s "$out" ]; then rm -f "$out"; return 1; fi
+  mv "$out" "$f"
+}
+
+# 已部署的 A 端升级：加上统计 + 出口探测。幂等，可反复跑。
+# 先备份，xray -test + validate_cfg 都过了才替换；服务起不来 apply_cfg 自动回滚。
+enable_stats(){
+  need_root
+  [ -f "$STATE/a.env" ] || die "只有 A 端（入口机）需要启用统计"
+  [ -f "$CFG" ] || die "找不到配置 $CFG"
+  ensure_migrated
+  ensure_stats_ports
+  local tmp; tmp=$(mktemp --suffix=.json)
+  cp "$CFG" "$tmp"
+  stats_sync "$tmp" 1 || { rm -f "$tmp"; die "统计配置生成失败（原配置未改动）"; }
+  if ATT_A="$CFG" ATT_B="$tmp" python3 -c 'import json,os,sys; a=json.load(open(os.environ["ATT_A"])); b=json.load(open(os.environ["ATT_B"])); sys.exit(0 if a==b else 1)'; then
+    rm -f "$tmp"; ok "流量统计 / 出口探测已启用，配置无需改动"; return 0
+  fi
+  "$XRAY_BIN" -test -config "$tmp" >/dev/null 2>&1 || {
+    "$XRAY_BIN" -test -config "$tmp" 2>&1 | tail -5; rm -f "$tmp"
+    die "新配置 xray -test 不通过（原配置未改动）"; }
+  local vmsg
+  if ! vmsg=$(validate_cfg "$tmp"); then
+    rm -f "$tmp"; echo "$vmsg" | sed 's/^/    /'
+    die "新配置自检不通过（原配置未改动）"
+  fi
+  warn "将重启 att-tunnel，连接会断几秒（分享链接、B 端都不变）"
+  apply_cfg "$tmp"
+  ok "已启用流量统计（API 仅监听 127.0.0.1:$STATS_API_PORT）和出口探测（127.0.0.1:$PROBE_PORT）"
+  systemctl is-active --quiet "$WEB_SVC" 2>/dev/null && systemctl restart "$WEB_SVC" || true
+}
+
+# ================= 网页流量面板（A 端） =================
+WEB_SVC="att-tunnel-web"
+WEB_DIR="/usr/local/lib/att-tunnel"
+WEB_PY="$WEB_DIR/web.py"
+WEB_ENV="$STATE/web.env"
+WEB_DATA="/var/lib/att-tunnel"
+
+write_web_py(){
+  mkdir -p "$WEB_DIR"
+  cat > "$WEB_PY.tmp" <<'ATT_WEB_PY'
+#!/usr/bin/env python3
+# att-tunnel 流量面板：只用 Python 标准库。
+# 数据来源：Xray StatsService（每 60s 带 -reset 拉一次，累加进本地 JSON，xray 重启也不丢总量）
+# 出口 IP：经本机 127.0.0.1 的 probe-in（socks5+密码）按节点走 portal-<节点>，访问 api.ipify.org
+# 安全：随机端口 + 随机路径前缀 + 登录密码（root 600 文件）；会话 Cookie HttpOnly/SameSite=Strict；
+#       重置/探测需 CSRF token；登录失败限速。面板绝不返回 vless 链接或 UUID。
+import hmac
+import http.cookies
+import http.server
+import ipaddress
+import json
+import os
+import secrets
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+CFG = os.environ.get('ATT_CFG', '/usr/local/etc/att-tunnel/config.json')
+ENVF = os.environ.get('ATT_WEB_ENV', '/etc/att-tunnel/web.env')
+STATEF = os.environ.get('ATT_WEB_STATE', '/var/lib/att-tunnel/web-state.json')
+XRAY = os.environ.get('ATT_XRAY', '/usr/local/bin/xray')
+POLL = int(os.environ.get('ATT_POLL', '60'))
+PROBE_EVERY = int(os.environ.get('ATT_PROBE_EVERY', '300'))
+SESSION_TTL = 12 * 3600
+IP_SOURCES = [('api.ipify.org', '/'), ('icanhazip.com', '/'), ('ifconfig.me', '/ip')]
+
+
+def load_env(path):
+    env = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+ENV = load_env(ENVF)
+PORT = int(ENV['WEB_PORT'])
+PREFIX = '/' + ENV['WEB_PATH'].strip('/')
+PASS = ENV['WEB_PASS']
+LISTEN = ENV.get('WEB_LISTEN', '0.0.0.0')
+if len(PASS) < 8 or PREFIX == '/':
+    sys.exit('web.env 不完整：WEB_PASS 至少 8 位，WEB_PATH 不能为空')
+
+lock = threading.RLock()
+probe_lock = threading.Lock()
+state = {'nodes': {}, 'last_poll': 0, 'poll_err': ''}
+
+
+def now():
+    return int(time.time())
+
+
+def load_state():
+    global state
+    try:
+        with open(STATEF) as f:
+            s = json.load(f)
+        if isinstance(s, dict) and isinstance(s.get('nodes'), dict):
+            state = s
+    except Exception:
+        pass
+
+
+def save_state():
+    # 原子写：先写临时文件再 rename，断电/崩溃不会留下半截 JSON
+    d = os.path.dirname(STATEF)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    tmp = '%s.tmp.%d' % (STATEF, os.getpid())
+    with lock:
+        data = json.dumps(state, ensure_ascii=False)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATEF)
+
+
+def read_cfg():
+    """从 config.json 读节点表：名称、入口端口、绑定出口、探测账号、API 地址。"""
+    with open(CFG) as f:
+        d = json.load(f)
+    api = (d.get('api') or {}).get('listen', '')
+    nodes, uport, probe_port, probe_acc = [], None, None, {}
+    for ib in d.get('inbounds', []):
+        if ib.get('tag') == 'user-in':
+            uport = ib.get('port')
+            for c in ib.get('settings', {}).get('clients', []):
+                nodes.append(c.get('email', 'node'))
+        elif ib.get('tag') == 'probe-in':
+            probe_port = ib.get('port')
+            for a in ib.get('settings', {}).get('accounts', []):
+                probe_acc[a.get('user', '')] = a.get('pass', '')
+    portal = {}
+    for r in d.get('routing', {}).get('rules', []):
+        ot = r.get('outboundTag', '')
+        if ot.startswith('portal') and 'probe-in' not in (r.get('inboundTag') or []):
+            for u in r.get('user', []):
+                portal[u] = ot
+    out = []
+    for n in nodes:
+        out.append({'name': n, 'port': uport, 'exit': portal.get(n, ''),
+                    'probe_user': 'probe-' + n,
+                    'probe_pass': probe_acc.get('probe-' + n, '')})
+    return {'api': api, 'probe_port': probe_port, 'nodes': out}
+
+
+def node_rec(name):
+    with lock:
+        return state['nodes'].setdefault(name, {
+            'up': 0, 'down': 0, 'since': now(), 'ip': '', 'ip_ts': 0,
+            'probe_ok': False, 'probe_ts': 0, 'probe_err': ''})
+
+
+def statsquery(api, pattern, reset=True):
+    cmd = [XRAY, 'api', 'statsquery', '--server=' + api, '-pattern', pattern]
+    if reset:
+        cmd.append('-reset')
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout).strip()[-200:] or 'statsquery 失败')
+    txt = p.stdout.strip()
+    if not txt:
+        return []
+    return (json.loads(txt).get('stat') or [])
+
+
+def poll_stats():
+    """拉取 user>>>节点>>>traffic>>>uplink/downlink 并清零，累加进本地状态。"""
+    try:
+        c = read_cfg()
+        if not c['api']:
+            raise RuntimeError('config.json 没有 api 段，请先在脚本里启用统计')
+        names = {n['name'] for n in c['nodes']}
+        stats = statsquery(c['api'], 'user>>>')
+        with lock:
+            for s in stats:
+                parts = s.get('name', '').split('>>>')
+                if len(parts) != 4 or parts[0] != 'user' or parts[2] != 'traffic':
+                    continue
+                n, direction = parts[1], parts[3]
+                if n not in names:
+                    continue  # probe-<节点> 的探测流量不计入
+                v = int(s.get('value') or 0)
+                r = node_rec(n)
+                if direction == 'uplink':
+                    r['up'] += v
+                elif direction == 'downlink':
+                    r['down'] += v
+            state['last_poll'] = now()
+            state['poll_err'] = ''
+    except Exception as e:
+        with lock:
+            state['poll_err'] = str(e)[:200]
+    save_state()
+def recv_exact(s, n):
+    b = b''
+    while len(b) < n:
+        x = s.recv(n - len(b))
+        if not x:
+            raise RuntimeError('socks 连接被关闭')
+        b += x
+    return b
+
+
+def socks5_get(port, user, pw, host, path, timeout=15):
+    """标准库 socks5（RFC1928/1929 密码认证）+ 明文 HTTP GET，返回响应体。"""
+    s = socket.create_connection(('127.0.0.1', port), timeout=timeout)
+    try:
+        s.sendall(b'\x05\x01\x02')
+        if recv_exact(s, 2) != b'\x05\x02':
+            raise RuntimeError('socks 不接受密码认证')
+        u, p = user.encode(), pw.encode()
+        s.sendall(b'\x01' + bytes([len(u)]) + u + bytes([len(p)]) + p)
+        if recv_exact(s, 2)[1] != 0:
+            raise RuntimeError('socks 认证失败')
+        h = host.encode()
+        s.sendall(b'\x05\x01\x00\x03' + bytes([len(h)]) + h + (80).to_bytes(2, 'big'))
+        rep = recv_exact(s, 4)
+        if rep[1] != 0:
+            raise RuntimeError('socks 连接失败 rep=%d' % rep[1])
+        atyp = rep[3]
+        if atyp == 1:
+            recv_exact(s, 6)
+        elif atyp == 4:
+            recv_exact(s, 18)
+        else:
+            recv_exact(s, recv_exact(s, 1)[0] + 2)
+        req = ('GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: curl/8.0\r\n'
+               'Accept: */*\r\nConnection: close\r\n\r\n' % (path, host))
+        s.sendall(req.encode())
+        buf = b''
+        while len(buf) < 65536:
+            x = s.recv(4096)
+            if not x:
+                break
+            buf += x
+    finally:
+        s.close()
+    head, _, body = buf.partition(b'\r\n\r\n')
+    status = head.split(b'\r\n', 1)[0]
+    if b' 200' not in status:
+        raise RuntimeError('HTTP ' + status.decode('latin1')[:40])
+    return body.decode('latin1').strip()
+
+
+def probe_node(n, probe_port):
+    r = node_rec(n['name'])
+    err = ''
+    ip = ''
+    if not probe_port or not n['probe_pass']:
+        err = '未配置探测账号'
+    else:
+        for host, path in IP_SOURCES:
+            try:
+                txt = socks5_get(probe_port, n['probe_user'], n['probe_pass'], host, path)
+                ip = str(ipaddress.ip_address(txt.split()[0]))
+                break
+            except Exception as e:
+                err = '%s: %s' % (host, str(e)[:80])
+    with lock:
+        r['probe_ts'] = now()
+        if ip:
+            r['ip'], r['ip_ts'], r['probe_ok'], r['probe_err'] = ip, now(), True, ''
+        else:
+            r['probe_ok'], r['probe_err'] = False, err
+
+
+def probe_all(only=None):
+    if not probe_lock.acquire(blocking=False):
+        return  # 已有一轮在跑
+    try:
+        c = read_cfg()
+        ths = []
+        for n in c['nodes']:
+            if only and n['name'] != only:
+                continue
+            t = threading.Thread(target=probe_node, args=(n, c['probe_port']), daemon=True)
+            t.start()
+            ths.append(t)
+        for t in ths:
+            t.join(60)
+    except Exception:
+        pass
+    finally:
+        probe_lock.release()
+    save_state()
+
+
+def worker():
+    last_probe = 0
+    while True:
+        poll_stats()
+        if time.time() - last_probe >= PROBE_EVERY:
+            last_probe = time.time()
+            threading.Thread(target=probe_all, daemon=True).start()
+        time.sleep(POLL)
+
+
+def status_json():
+    try:
+        c = read_cfg()
+        cfg_err = ''
+    except Exception as e:
+        c, cfg_err = {'nodes': []}, str(e)[:200]
+    t = now()
+    out = []
+    with lock:
+        for n in c['nodes']:
+            r = node_rec(n['name'])
+            online = bool(r['probe_ok'] and t - r['probe_ts'] <= PROBE_EVERY + POLL + 30)
+            out.append({'name': n['name'], 'port': n['port'], 'exit': n['exit'],
+                        'online': online, 'ip': r['ip'], 'ip_ts': r['ip_ts'],
+                        'probe_ts': r['probe_ts'], 'probe_err': r['probe_err'],
+                        'up': r['up'], 'down': r['down'], 'total': r['up'] + r['down'],
+                        'since': r['since']})
+        return {'now': t, 'last_poll': state['last_poll'],
+                'error': cfg_err or state['poll_err'], 'nodes': out}
+sessions = {}   # sid -> {'exp': ts, 'csrf': token}
+fails = {}      # ip -> [失败时间戳]
+FAIL_WIN, FAIL_MAX = 600, 5
+
+
+def rate_limited(ip):
+    t = time.time()
+    with lock:
+        lst = [x for x in fails.get(ip, []) if t - x < FAIL_WIN]
+        fails[ip] = lst
+        return len(lst) >= FAIL_MAX
+
+
+def note_fail(ip):
+    with lock:
+        fails.setdefault(ip, []).append(time.time())
+
+
+def new_session():
+    sid, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
+    with lock:
+        t = time.time()
+        for k in [k for k, v in sessions.items() if v['exp'] < t]:
+            del sessions[k]
+        sessions[sid] = {'exp': t + SESSION_TTL, 'csrf': csrf}
+    return sid
+
+
+PAGE_LOGIN = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>att-tunnel 登录</title>
+<style>body{font-family:system-ui,sans-serif;background:#f4f5f7;margin:0;display:flex;
+min-height:100vh;align-items:center;justify-content:center}form{background:#fff;padding:24px;
+border-radius:12px;box-shadow:0 2px 12px #0001;width:min(320px,90vw)}input,button{width:100%;
+box-sizing:border-box;padding:10px;margin-top:10px;font-size:16px;border-radius:8px;
+border:1px solid #ccc}button{background:#2563eb;color:#fff;border:0}.e{color:#c00}</style></head>
+<body><form method="post" action="{P}/login"><h2>att-tunnel 流量面板</h2>{E}
+<label for="pw">密码</label><input id="pw" type="password" name="password" autocomplete="current-password" required autofocus>
+<button type="submit">登录</button></form></body></html>'''
+PAGE_MAIN = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>att-tunnel 流量面板</title>
+<style>body{font-family:system-ui,sans-serif;background:#f4f5f7;margin:0;padding:12px;color:#222}
+h1{font-size:20px;margin:4px 0 12px}.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+button{padding:8px 14px;border-radius:8px;border:1px solid #bbb;background:#fff;font-size:15px;cursor:pointer}
+button.p{background:#2563eb;color:#fff;border:0}button.d{color:#b91c1c;border-color:#e5a5a5}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.card{background:#fff;border-radius:12px;padding:14px;box-shadow:0 1px 6px #0001}
+.card h2{font-size:17px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:center}
+.on{color:#15803d}.off{color:#b91c1c}dl{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;margin:0 0 10px}
+dt{color:#666}dd{margin:0;word-break:break-all}.m{color:#666;font-size:13px}.err{color:#b91c1c}</style></head>
+<body><h1>att-tunnel 流量面板</h1>
+<div class="bar"><button class="p" id="probe" type="button">立即探测出口 IP</button>
+<button id="refresh" type="button">刷新</button>
+<form method="post" action="{P}/logout" style="margin:0"><input type="hidden" name="csrf" value="{C}">
+<button type="submit">退出</button></form><span class="m" id="meta" aria-live="polite"></span></div>
+<div class="err" id="err" role="alert"></div><div class="grid" id="list"></div>
+<script>
+const P="{P}",C="{C}";
+function fb(n){const u=["B","KB","MB","GB","TB"];let i=0;while(n>=1024&&i<4){n/=1024;i++}return n.toFixed(i?2:0)+" "+u[i]}
+function ft(t){if(!t)return"从未";const d=new Date(t*1000);return d.toLocaleString("zh-CN",{hour12:false})}
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+async function post(u,body){const r=await fetch(P+u,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":C},body:new URLSearchParams(body)});if(r.status==401)location.href=P+"/";return r}
+async function load(){try{const r=await fetch(P+"/api/status",{cache:"no-store"});if(r.status==401){location.href=P+"/";return}
+const d=await r.json();document.getElementById("err").textContent=d.error?("统计异常："+d.error):"";
+document.getElementById("meta").textContent="流量更新于 "+ft(d.last_poll)+"（每 60 秒）";
+document.getElementById("list").innerHTML=d.nodes.map(n=>`<section class="card"><h2><span>${esc(n.name)}</span>
+<span class="${n.online?"on":"off"}">${n.online?"● 在线":"● 离线"}</span></h2><dl>
+<dt>入口端口</dt><dd>${esc(n.port)}</dd><dt>绑定出口</dt><dd>${esc(n.exit||"未绑定")}</dd>
+<dt>出口 IP</dt><dd>${esc(n.ip||"—")}</dd><dt>最后在线</dt><dd>${ft(n.ip_ts)}</dd>
+<dt>上传</dt><dd>${fb(n.up)}</dd><dt>下载</dt><dd>${fb(n.down)}</dd><dt>合计</dt><dd><b>${fb(n.total)}</b></dd>
+<dt>统计起点</dt><dd>${ft(n.since)}</dd></dl>${(!n.online&&n.probe_err)?`<div class="m err">${esc(n.probe_err)}</div>`:""}
+<button class="d" type="button" data-reset="${esc(n.name)}">重置</button></section>`).join("")||"<p>没有节点</p>"}
+catch(e){document.getElementById("err").textContent="加载失败："+e}}
+document.getElementById("list").addEventListener("click",async e=>{const n=e.target.getAttribute("data-reset");if(!n)return;
+if(!confirm("确定把节点 "+n+" 的累计流量清零？"))return;await post("/api/reset",{node:n});load()});
+document.getElementById("refresh").onclick=load;
+document.getElementById("probe").onclick=async e=>{e.target.disabled=true;e.target.textContent="探测中…";
+await post("/api/probe",{});e.target.disabled=false;e.target.textContent="立即探测出口 IP";load()};
+load();setInterval(load,30000);
+</script></body></html>'''
+class H(http.server.BaseHTTPRequestHandler):
+    server_version = 'att-web'
+    sys_version = ''
+
+    def log_message(self, fmt, *a):
+        pass  # 不记访问日志（里面会有路径前缀）
+
+    def send(self, code, body, ctype='text/html; charset=utf-8', extra=None):
+        b = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(b)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Content-Security-Policy',
+                         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                         "connect-src 'self'; form-action 'self'; frame-ancestors 'none'")
+        for k, v in (extra or []):
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(b)
+
+    def redirect(self, to, extra=None):
+        self.send(303, '', extra=[('Location', to)] + (extra or []))
+
+    def session(self):
+        c = http.cookies.SimpleCookie()
+        try:
+            c.load(self.headers.get('Cookie', ''))
+        except Exception:
+            return None, None
+        m = c.get('att_sid')
+        if not m:
+            return None, None
+        with lock:
+            s = sessions.get(m.value)
+            if not s or s['exp'] < time.time():
+                return None, None
+            return m.value, s
+
+    def form(self):
+        n = min(int(self.headers.get('Content-Length') or 0), 4096)
+        raw = self.rfile.read(n).decode('utf-8', 'replace') if n else ''
+        return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+
+    def route(self):
+        p = urllib.parse.urlsplit(self.path).path
+        if p != PREFIX and not p.startswith(PREFIX + '/'):
+            return None
+        return p[len(PREFIX):] or '/'
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        r = self.route()
+        if r is None:
+            return self.send(404, 'Not Found', 'text/plain')
+        sid, s = self.session()
+        if r == '/':
+            if not s:
+                return self.send(200, PAGE_LOGIN.replace('{P}', PREFIX).replace('{E}', ''))
+            return self.send(200, PAGE_MAIN.replace('{P}', PREFIX).replace('{C}', s['csrf']))
+        if r == '/api/status':
+            if not s:
+                return self.send(401, '{"error":"unauthorized"}', 'application/json')
+            return self.send(200, json.dumps(status_json(), ensure_ascii=False),
+                             'application/json; charset=utf-8')
+        return self.send(404, 'Not Found', 'text/plain')
+    def do_POST(self):
+        r = self.route()
+        if r is None:
+            return self.send(404, 'Not Found', 'text/plain')
+        ip = self.client_address[0]
+        if r == '/login':
+            if rate_limited(ip):
+                return self.send(429, PAGE_LOGIN.replace('{P}', PREFIX).replace(
+                    '{E}', '<p class="e">失败次数过多，请 10 分钟后再试</p>'))
+            f = self.form()
+            if hmac.compare_digest(f.get('password', '').encode(), PASS.encode()):
+                sid = new_session()
+                ck = ('att_sid=%s; Path=%s; HttpOnly; SameSite=Strict; Max-Age=%d'
+                      % (sid, PREFIX, SESSION_TTL))
+                return self.redirect(PREFIX + '/', [('Set-Cookie', ck)])
+            note_fail(ip)
+            time.sleep(1)
+            return self.send(401, PAGE_LOGIN.replace('{P}', PREFIX).replace(
+                '{E}', '<p class="e">密码错误</p>'))
+        sid, s = self.session()
+        if not s:
+            return self.send(401, '{"error":"unauthorized"}', 'application/json')
+        f = self.form()
+        tok = self.headers.get('X-CSRF-Token') or f.get('csrf', '')
+        if not hmac.compare_digest(tok.encode(), s['csrf'].encode()):
+            return self.send(403, '{"error":"csrf"}', 'application/json')
+        if r == '/logout':
+            with lock:
+                sessions.pop(sid, None)
+            ck = 'att_sid=; Path=%s; HttpOnly; SameSite=Strict; Max-Age=0' % PREFIX
+            return self.redirect(PREFIX + '/', [('Set-Cookie', ck)])
+        if r == '/api/reset':
+            n = f.get('node', '')
+            try:
+                names = {x['name'] for x in read_cfg()['nodes']}
+            except Exception:
+                names = set()
+            if n not in names:
+                return self.send(404, '{"error":"no such node"}', 'application/json')
+            with lock:
+                rec = node_rec(n)
+                rec['up'] = rec['down'] = 0
+                rec['since'] = now()
+            save_state()
+            return self.send(200, '{"ok":true}', 'application/json')
+        if r == '/api/probe':
+            probe_all(f.get('node') or None)
+            return self.send(200, '{"ok":true}', 'application/json')
+        return self.send(404, 'Not Found', 'text/plain')
+
+
+class Srv(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    load_state()
+    threading.Thread(target=worker, daemon=True).start()
+    Srv((LISTEN, PORT), H).serve_forever()
+
+
+if __name__ == '__main__':
+    main()
+ATT_WEB_PY
+  chmod 700 "$WEB_PY.tmp"; mv "$WEB_PY.tmp" "$WEB_PY"
+}
+
+web_url(){
+  # shellcheck disable=SC1090,SC1091
+  source "$STATE/a.env"
+  # shellcheck disable=SC1090,SC1091
+  source "$WEB_ENV"
+  echo "http://$A_IP:$WEB_PORT/$WEB_PATH/"
+}
+
+web_enable(){
+  need_root
+  [ -f "$STATE/a.env" ] || die "网页面板只在 A 端（入口机）上用"
+  command -v python3 >/dev/null || die "缺 python3"
+  stats_enabled || enable_stats
+  stats_enabled || die "统计未启用，无法开面板"
+  if [ ! -f "$WEB_ENV" ]; then
+    local p; p=$(free_port)
+    umask 077
+    printf 'WEB_PORT=%s\nWEB_PATH=%s\nWEB_PASS=%s\nWEB_LISTEN=0.0.0.0\n' \
+      "$p" "$(openssl rand -hex 8)" "$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-16)" > "$WEB_ENV"
+    umask 022
+  fi
+  chmod 600 "$WEB_ENV"; chown root:root "$WEB_ENV"
+  write_web_py
+  mkdir -p "$WEB_DATA"; chmod 700 "$WEB_DATA"
+  cat > "/etc/systemd/system/$WEB_SVC.service" <<EOF
+[Unit]
+Description=att-tunnel 流量面板
+After=network-online.target $SVC.service
+
+[Service]
+Type=simple
+Environment=ATT_CFG=$CFG ATT_WEB_ENV=$WEB_ENV ATT_WEB_STATE=$WEB_DATA/web-state.json ATT_XRAY=$XRAY_BIN
+ExecStart=$(command -v python3) $WEB_PY
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "$WEB_SVC" >/dev/null 2>&1 || true
+  systemctl restart "$WEB_SVC"
+  sleep 2
+  systemctl is-active --quiet "$WEB_SVC" || {
+    journalctl -u "$WEB_SVC" -n 15 --no-pager 2>&1 | tail -10
+    die "面板启动失败"; }
+  # shellcheck disable=SC1090
+  source "$WEB_ENV"
+  open_fw "$WEB_PORT"
+  ok "网页面板已启用"
+  web_info
+}
+
+web_disable(){
+  need_root
+  systemctl stop "$WEB_SVC" 2>/dev/null || true
+  systemctl disable "$WEB_SVC" 2>/dev/null || true
+  rm -f "/etc/systemd/system/$WEB_SVC.service"
+  systemctl daemon-reload 2>/dev/null || true
+  ok "网页面板已关闭（累计流量数据保留在 $WEB_DATA，重新开启后继续累计）"
+}
+
+web_info(){
+  [ -f "$WEB_ENV" ] || { warn "网页面板还没启用（菜单 13）"; return 1; }
+  # shellcheck disable=SC1090
+  source "$WEB_ENV"
+  if systemctl is-active --quiet "$WEB_SVC" 2>/dev/null; then ok "面板运行中"; else warn "面板当前未运行"; fi
+  echo "  地址：${GRN}$(web_url)${RST}"
+  echo "  密码：${GRN}$WEB_PASS${RST}"
+  echo "  ${YEL}面板是明文 HTTP，靠随机路径 + 密码保护；别在不可信网络里登录，地址和密码不要外发${RST}"
+  warn "云厂商安全组需放行 $WEB_PORT/tcp 才能从外面打开"
+}
+
+web_menu(){
+  if systemctl is-active --quiet "$WEB_SVC" 2>/dev/null; then
+    read -rp "面板运行中，关闭它？（输 yes）: " c
+    [ "$c" = yes ] && web_disable || warn "未改动"
+  else
+    web_enable
+  fi
 }
 
 # ================= 自检 =================
@@ -1372,6 +2144,9 @@ uninstall(){
   need_root
   read -rp "确认卸载 att-tunnel？（不影响你其他 xray 节点，输 yes）: " c
   [ "$c" = yes ] || { warn "已取消"; return; }
+  systemctl stop "$WEB_SVC" 2>/dev/null || true
+  systemctl disable "$WEB_SVC" 2>/dev/null || true
+  rm -f "/etc/systemd/system/$WEB_SVC.service"
   systemctl stop "$SVC" 2>/dev/null || true
   systemctl disable "$SVC" 2>/dev/null || true
   rm -f "/etc/systemd/system/$SVC.service"
@@ -1380,7 +2155,8 @@ uninstall(){
   mkdir -p "$bdir"
   [ -f "$CFG" ] && cp "$CFG" "$bdir/" 2>/dev/null || true
   [ -d "$STATE" ] && cp -r "$STATE" "$bdir/" 2>/dev/null || true
-  rm -rf "$STATE" "$CFG_DIR"
+  [ -d "$WEB_DATA" ] && cp -r "$WEB_DATA" "$bdir/" 2>/dev/null || true
+  rm -rf "$STATE" "$CFG_DIR" "$WEB_DIR" "$WEB_DATA"
   ok "已停止并清理 att-tunnel。备份在：$bdir"
   ok "你机器上原有的 xray / 3x-ui / NodeLite 未受影响"
   warn "Xray 二进制未删除（可能其他服务在用）"
@@ -1404,6 +2180,9 @@ menu(){
     echo "  9) 升级配置为 1:1 多出口结构（平滑，客户端不变）"
     echo " 10) SSH 搬到高位端口（可选，小心）"
     echo " 11) 卸载"
+    echo " 12) 启用流量统计 / 出口探测（老 A 机升级，幂等）"
+    echo " 13) 网页流量面板：开启 / 关闭"
+    echo " 14) 查看网页面板地址和密码"
     echo "  0) 退出"
     echo
     read -rp "选择: " ch
@@ -1419,6 +2198,9 @@ menu(){
       9) migrate_menu ;;
       10) ssh_migrate ;;
       11) uninstall ;;
+      12) enable_stats ;;
+      13) web_menu ;;
+      14) web_info ;;
       0) exit 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -1438,7 +2220,11 @@ case "${1:-}" in
   --list)     show_exits ;;
   --exit-cmd) show_exit_cmd "${2:-}" ;;
   --migrate)  migrate_cfg ;;
+  --enable-stats) enable_stats ;;
+  --web)      web_enable ;;
+  --web-off)  web_disable ;;
+  --web-info) web_info ;;
   --version)  echo "att-tunnel v$VERSION" ;;
   "")         menu ;;
-  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --check | --links | --list | --add NAME | --del NAME | --exit-cmd NAME | --migrate）" ;;
+  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --check | --links | --list | --add NAME | --del NAME | --exit-cmd NAME | --migrate | --enable-stats | --web | --web-off | --web-info）" ;;
 esac
