@@ -31,6 +31,18 @@ die(){  echo "${RED}[X]${RST} $*" >&2; exit 1; }
 
 need_root(){ [ "$(id -u)" = 0 ] || die "请用 root 运行"; }
 
+# 非交互模式（网页面板调用 / 自动化）：ATT_NONINTERACTIVE=1，所有 read 改用环境变量或默认值
+noninteractive(){ [ "${ATT_NONINTERACTIVE:-0}" = 1 ]; }
+
+# 改配置的操作全局串行：面板和终端同时加/删节点时，后来者等最多 120 秒
+cfg_lock(){
+  [ -n "${ATT_CFG_LOCKED:-}" ] && return 0
+  mkdir -p /run/lock 2>/dev/null || true
+  exec 9>/run/lock/att-tunnel.lock
+  flock -w 120 9 || die "另一个加/删节点操作正在进行，请稍后再试"
+  ATT_CFG_LOCKED=1
+}
+
 # ---------- 依赖 ----------
 install_deps(){
   local miss=()
@@ -967,19 +979,23 @@ migrate_menu(){
   migrate_cfg
 }
 
+# show_links [NAME]：不带参数列出全部；带 NAME 只输出该节点的一行 vless 链接
 show_links(){
+  local only="${1:-}" found=0
   [ -f "$STATE/a.env" ] || { warn "本机不是 A 端，或尚未部署"; return 1; }
   # shellcheck disable=SC1090
   source "$STATE/a.env"
-  echo "${BLD}--- 客户端分享链接 ---${RST}"
+  [ -n "$only" ] || echo "${BLD}--- 客户端分享链接 ---${RST}"
   local epath; epath=$(printf '%s' "$XPATH" | sed 's|/|%2F|g')
   local tr="${TRANSPORT:-xhttp}"
   local uport="${USER_PORT:-443}"
   local rows; rows=$(list_exits 2>/dev/null || true)
-  local n uuid fl qs
-  # flow 由每个用户自己的配置决定，不能一刀切
-  while read -r n uuid fl; do
+  local n uuid fl qs np ns
+  # flow 由每个用户自己的配置决定，不能一刀切；端口 / 伪装域名按节点所在入站（user-in 或 user-in-<端口>）
+  while read -r n uuid fl np ns; do
     [ -z "$n" ] && continue
+    [ "$fl" = "-" ] && fl=""
+    [ -n "${only:-}" ] && [ "$n" != "$only" ] && continue
     if [ "$tr" = xhttp ]; then
       qs="type=xhttp&path=$epath&mode=auto"
     elif [ "$fl" = "xtls-rprx-vision" ]; then
@@ -995,18 +1011,28 @@ show_links(){
     else
       tip="  出口：${CYN}$ptag${RST}"
     fi
+    local link="vless://$uuid@$A_IP:${np:-$uport}?encryption=none&security=reality&$qs&sni=${ns:-$SNI}&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID#$n"
+    # --link NAME：只输出这一条链接（给面板用）
+    if [ -n "${only:-}" ]; then echo "$link"; found=1; continue; fi
     echo
     echo "${CYN}[$n]${RST}$tip"
-    echo "vless://$uuid@$A_IP:$uport?encryption=none&security=reality&$qs&sni=$SNI&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID#$n"
+    echo "$link"
   done < <("$XRAY_BIN" -test -config "$CFG" >/dev/null 2>&1 && ATT_CFG="$CFG" python3 - <<'PY'
 import json,os
 d=json.load(open(os.environ['ATT_CFG']))
 for ib in d['inbounds']:
-    if ib.get('tag')=='user-in':
+    t=str(ib.get('tag',''))
+    if t=='user-in' or t.startswith('user-in-'):
+        rs=(ib.get('streamSettings') or {}).get('realitySettings') or {}
+        sni=(rs.get('serverNames') or [''])[0]
         for c in ib['settings']['clients']:
-            print(c.get('email','node'), c['id'], c.get('flow',''))
+            print(c.get('email','node'), c['id'], c.get('flow','') or '-', ib.get('port',''), sni)
 PY
 )
+  if [ -n "${only:-}" ]; then
+    [ "${found:-0}" = 1 ] || die "节点 $only 不存在"
+    return 0
+  fi
   echo
   echo "${BLD}一个节点 = 一台出口机${RST}（严格 1:1）。拿某节点的出口机部署命令：菜单 6"
   echo "隧道是否全部连上：菜单 8（自检）。A 侧无法把单条连接对到具体节点，只能看总数。"
@@ -1037,18 +1063,58 @@ add_node(){
   # shellcheck disable=SC1090
   source "$STATE/a.env"
   ensure_migrated
+  cfg_lock
   local name="${1:-}"
-  [ -n "$name" ] || { read -rp "节点名称（如 node2）: " name; }
+  if [ -z "$name" ] && ! noninteractive; then read -rp "节点名称（如 node2）: " name; fi
   [ -n "$name" ] || die "名称不能为空"
-  # 节点名会拼进 portal 标签和分享链接，限制字符集
+  # 节点名会拼进 portal 标签和分享链接，限制字符集（网页面板用同一条规则）
   printf '%s' "$name" | grep -qE '^[A-Za-z0-9_-]{1,32}$' \
     || die "名称只能用字母/数字/下划线/连字符，最多 32 位"
+  list_nodes 2>/dev/null | grep -qxF "$name" && die "节点 $name 已存在（原配置未改动）"
 
-  local uport
-  read -rp "为这个节点指定入口端口（回车使用已有的 ${USER_PORT:-443}）: " uport
+  # 入口端口：ATT_NODE_PORT > 交互输入 > 主入口端口
+  local uport="${ATT_NODE_PORT:-}"
+  if [ -z "$uport" ] && ! noninteractive; then
+    read -rp "为这个节点指定入口端口（回车使用已有的 ${USER_PORT:-443}）: " uport
+  fi
   [ -n "$uport" ] || uport="${USER_PORT:-443}"
   case "$uport" in (*[!0-9]*) die "端口必须是数字";; esac
   [ "$uport" -ge 1 ] && [ "$uport" -le 65535 ] || die "端口越界（1-65535）"
+  uport=$((10#$uport))
+
+  # 伪装域名：只有单独端口的新入口才能自定义；共用已有入口时沿用它的域名
+  local nsni="${ATT_NODE_SNI:-}" existing=""
+  existing=$(ATT_CFG="$CFG" P="$uport" python3 -c '
+import json,os
+d=json.load(open(os.environ["ATT_CFG"]))
+for ib in d.get("inbounds",[]):
+    t=str(ib.get("tag",""))
+    if (t=="user-in" or t.startswith("user-in-")) and str(ib.get("port"))==os.environ["P"]:
+        rs=(ib.get("streamSettings") or {}).get("realitySettings") or {}
+        print((rs.get("serverNames") or ["?"])[0]); break')
+  if [ -n "$existing" ]; then
+    if [ -n "$nsni" ] && [ "$nsni" != "$existing" ]; then
+      warn "端口 $uport 已有入口，伪装域名沿用它的 $existing（忽略 $nsni）"
+    fi
+    nsni="$existing"
+  else
+    [ "$uport" = "${REVERSE_PORT:-}" ] && die "端口 $uport 是反代隧道端口，不能当入口"
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$uport\$"; then
+      die "端口 $uport 已被占用（原配置未改动）"
+    fi
+    if [ -z "$nsni" ] && ! noninteractive; then
+      read -rp "伪装域名（回车沿用主入口的 $SNI；输 list 从预置列表选；或直接输入域名）: " nsni
+      if [ "$nsni" = list ]; then pick_sni_interactive || die "没有可用的伪装域名"; nsni="$SNI_PICKED"; fi
+    fi
+    [ -n "$nsni" ] || nsni="$SNI"
+    printf '%s' "$nsni" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$' \
+      || die "伪装域名格式不对：$nsni"
+    if [ "$nsni" != "$SNI" ]; then
+      info "实测 $nsni 的 TLS 1.3 ..."
+      sni_ok "$nsni" || die "伪装域名 $nsni 不支持 TLS 1.3 或连不上（原配置未改动）"
+    fi
+    info "节点 $name 将使用单独入口：端口 $uport，伪装域名 $nsni"
+  fi
 
   local uuid buuid
   uuid=$("$XRAY_BIN" uuid)    # 客户端用
@@ -1056,28 +1122,48 @@ add_node(){
 
   local tmp; tmp=$(mktemp --suffix=.json)
   local rc=0
-  NEW_NAME="$name" NEW_UUID="$uuid" NEW_BUUID="$buuid" ATT_CFG="$CFG" python3 - > "$tmp" <<'PY' || rc=$?
-import json,os
+  NEW_NAME="$name" NEW_UUID="$uuid" NEW_BUUID="$buuid" NEW_PORT="$uport" NEW_SNI="$nsni" \
+    ATT_CFG="$CFG" python3 - > "$tmp" <<'PY' || rc=$?
+import copy,json,os
 d=json.load(open(os.environ['ATT_CFG']))
 name=os.environ['NEW_NAME']
 uuid=os.environ['NEW_UUID']; buuid=os.environ['NEW_BUUID']
+port=int(os.environ['NEW_PORT']); sni=os.environ['NEW_SNI']
 ptag='portal-%s'%name
+def is_ui(ib):
+    t=str(ib.get('tag',''))
+    return t=='user-in' or t.startswith('user-in-')
+uis=[ib for ib in d['inbounds'] if is_ui(ib)]
+main=[ib for ib in uis if ib.get('tag')=='user-in']
+if not main:
+    raise SystemExit('NOMAIN')
+main=main[0]
+for ib in uis:
+    if any(c.get('email')==name for c in ib['settings']['clients']):
+        raise SystemExit('DUP')
 
 # raw 模式必带 Vision（抗封）；xhttp 不支持 flow
-vision=False
-for ib in d['inbounds']:
-    if ib.get('tag')=='user-in' and ib['streamSettings'].get('network')=='raw':
-        vision=True
+vision=(main.get('streamSettings') or {}).get('network')=='raw'
+c={'id':uuid,'email':name}
+if vision:
+    c['flow']='xtls-rprx-vision'
 
-for ib in d['inbounds']:
-    if ib.get('tag')=='user-in':
-        cs=ib['settings']['clients']
-        if any(c.get('email')==name for c in cs):
-            raise SystemExit('DUP')
-        c={'id':uuid,'email':name}
-        if vision:
-            c['flow']='xtls-rprx-vision'
-        cs.append(c)
+# 节点放进同端口的入口；该端口还没有入口时，按主入口克隆一个 user-in-<端口>
+# （同一套 REALITY 密钥 / shortId，只换端口和伪装域名）
+tgt=[ib for ib in uis if ib.get('port')==port]
+if tgt:
+    tgt[0]['settings']['clients'].append(c)
+else:
+    ib=copy.deepcopy(main)
+    ib['tag']='user-in-%d'%port
+    ib['port']=port
+    ib['settings']['clients']=[c]
+    rs=(ib.get('streamSettings') or {}).get('realitySettings')
+    if rs is not None:
+        rs['serverNames']=[sni]
+        if 'target' in rs: rs['target']='%s:443'%sni
+        if 'dest' in rs: rs['dest']='%s:443'%sni
+    d['inbounds'].insert(d['inbounds'].index(uis[-1])+1, ib)
 
 # 严格 1:1：这个节点自己的 bridge client + 自己的 portal 标签
 for ib in d['inbounds']:
@@ -1106,7 +1192,8 @@ PY
 
   apply_cfg "$tmp"
   open_fw "$REVERSE_PORT" 2>/dev/null || true
-  ok "节点 $name 已添加（专属出口 portal-$name）"
+  [ "$uport" = "${USER_PORT:-443}" ] || open_fw "$uport" 2>/dev/null || true
+  ok "节点 $name 已添加（专属出口 portal-$name，入口端口 $uport，伪装域名 $nsni）"
   warn "这个节点现在还没有出口机，隧道未建立前不可用"
   print_b_cmd "$buuid" "$name"
   echo
@@ -1181,8 +1268,10 @@ del_node(){
   local names; names=$(printf '%s\n' "$rows" | cut -f1)
   local total; total=$(printf '%s\n' "$names" | grep -c .)
 
+  cfg_lock
   local name="${1:-}"
   if [ -z "$name" ]; then
+    noninteractive && die "非交互模式必须指定节点名：--del NAME"
     echo "${BLD}--- 当前节点 / 出口机 ---${RST}"
     local i=0 n p u
     while IFS=$'\t' read -r n p u; do
@@ -1210,7 +1299,14 @@ del_node(){
   echo
   warn "将一并删除它的专属出口绑定${ptag:+（$ptag）}"
   warn "对应的出口机会失去连接。它上面的 att-tunnel 需你自己去卸载（否则它会一直重试拨号）"
-  read -rp "确认删除节点 ${BLD}$name${RST}？它的分享链接会立刻失效（输 yes）: " c
+  local c=""
+  if noninteractive; then
+    # 非交互（网页面板 / 脚本调用）：必须显式 ATT_YES=1，面板那边已让用户输入节点名确认
+    [ "${ATT_YES:-}" = 1 ] || die "非交互删除需要 ATT_YES=1"
+    c=yes
+  else
+    read -rp "确认删除节点 ${BLD}$name${RST}？它的分享链接会立刻失效（输 yes）: " c
+  fi
   [ "$c" = yes ] || { warn "已取消"; return; }
 
   local tmp; tmp=$(mktemp --suffix=.json)
@@ -1228,15 +1324,22 @@ for r in d.get('routing',{}).get('rules',[]):
         ptags.add(ot)
 
 found=False
+ibs=[]
 for ib in d.get('inbounds',[]):
-    if ib.get('tag')=='user-in':
+    t=str(ib.get('tag',''))
+    if t=='user-in' or t.startswith('user-in-'):
         cs=ib['settings']['clients']
         keep=[c for c in cs if c.get('email')!=name]
         if len(keep)!=len(cs):
             found=True
         if not keep:
+            # 额外入口（user-in-<端口>）空了就整个删掉；主入口必须留至少一个
+            if t!='user-in':
+                continue
             raise SystemExit('LAST')
         ib['settings']['clients']=keep
+    ibs.append(ib)
+d['inbounds']=ibs
 if not found:
     raise SystemExit('NOTFOUND')
 
@@ -1434,6 +1537,7 @@ enable_stats(){
 WEB_SVC="att-tunnel-web"
 WEB_DIR="/usr/local/lib/att-tunnel"
 WEB_PY="$WEB_DIR/web.py"
+WEB_SCRIPT="$WEB_DIR/att-tunnel.sh"
 WEB_ENV="$STATE/web.env"
 WEB_DATA="/var/lib/att-tunnel"
 
@@ -1471,7 +1575,7 @@ ENVF = os.environ.get('ATT_WEB_ENV', '/etc/att-tunnel/web.env')
 AENV = os.environ.get('ATT_A_ENV', '/etc/att-tunnel/a.env')
 STATEF = os.environ.get('ATT_WEB_STATE', '/var/lib/att-tunnel/web-state.json')
 XRAY = os.environ.get('ATT_XRAY', '/usr/local/bin/xray')
-SCRIPT = '/nonexistent/att-tunnel.sh'  # 本版本只读
+SCRIPT = os.environ.get('ATT_SCRIPT', '/usr/local/lib/att-tunnel/att-tunnel.sh')
 SVC = os.environ.get('ATT_SVC', 'att-tunnel')
 POLL = int(os.environ.get('ATT_POLL', '10'))
 PROBE_EVERY = int(os.environ.get('ATT_PROBE_EVERY', '300'))
@@ -1840,7 +1944,7 @@ def status_json():
                 'reverse_port': rp, 'tunnels': tunnel_count(int(rp)) if rp.isdigit() else 0,
                 'xray_active': state.get('xray_active', False), 'xray_since': state.get('xray_since', ''),
                 'last_poll': state['last_poll'], 'poll': POLL, 'probe_every': PROBE_EVERY,
-                'error': cfg_err or state['poll_err'], 'nodes': out, 'busy': mut_lock.locked(), 'manage': False}
+                'error': cfg_err or state['poll_err'], 'nodes': out, 'busy': mut_lock.locked(), 'manage': os.path.isfile(SCRIPT)}
 
 
 def run_script(args, extra_env=None, timeout=180):
@@ -2294,10 +2398,39 @@ web_url(){
   echo "http://$A_IP:$WEB_PORT/$WEB_PATH/"
 }
 
+# 面板加/删节点调用的是本机脚本副本（同一套配置逻辑、校验和回滚，不在面板里重写）。
+# 本地文件运行：直接复制自己；bash <(curl ...) 运行（\$0 是管道读不回来）：按 RAW_URL 重新下载，
+# 并核对版本号一致，防止拉到别的分支。
+install_script_copy(){
+  mkdir -p "$WEB_DIR"
+  local tmp; tmp=$(mktemp)
+  if [ -f "$0" ] && [ -r "$0" ] && grep -q '^VERSION="'"$VERSION"'"' "$0" 2>/dev/null; then
+    cp "$0" "$tmp"
+  elif ! curl -fsSL --max-time 60 -o "$tmp" "$RAW_URL"; then
+    rm -f "$tmp"; warn "下载脚本副本失败（$RAW_URL），面板暂不能加/删节点"; return 1
+  fi
+  if ! grep -q '^VERSION="'"$VERSION"'"' "$tmp" || ! bash -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    warn "脚本副本版本与当前不一致（$RAW_URL 不是 v$VERSION），面板暂不能加/删节点"
+    warn "用 ATT_RAW_URL 指向本版本的 install.sh 再跑一次 --web"
+    return 1
+  fi
+  install -m 700 -o root -g root "$tmp" "$WEB_SCRIPT"; rm -f "$tmp"
+  ok "脚本副本已更新：$WEB_SCRIPT（v$VERSION）"
+}
+
+# 把本次用的脚本地址记进 web.env，面板生成的出口机命令指向同一版本
+save_web_raw_url(){
+  [ -f "$WEB_ENV" ] || return 0
+  sed -i '/^WEB_RAW_URL=/d' "$WEB_ENV"
+  printf 'WEB_RAW_URL=%s\n' "$RAW_URL" >> "$WEB_ENV"
+}
+
 web_enable(){
   need_root
   [ -f "$STATE/a.env" ] || die "网页面板只在 A 端（入口机）上用"
   command -v python3 >/dev/null || die "缺 python3"
+  command -v flock >/dev/null || die "缺 flock（util-linux）"
   stats_enabled || enable_stats
   stats_enabled || die "统计未启用，无法开面板"
   if [ ! -f "$WEB_ENV" ]; then
@@ -2309,6 +2442,8 @@ web_enable(){
   fi
   chmod 600 "$WEB_ENV"; chown root:root "$WEB_ENV"
   write_web_py
+  install_script_copy || true
+  save_web_raw_url
   mkdir -p "$WEB_DATA"; chmod 700 "$WEB_DATA"
   cat > "/etc/systemd/system/$WEB_SVC.service" <<EOF
 [Unit]
@@ -2318,6 +2453,7 @@ After=network-online.target $SVC.service
 [Service]
 Type=simple
 Environment=ATT_CFG=$CFG ATT_WEB_ENV=$WEB_ENV ATT_WEB_STATE=$WEB_DATA/web-state.json ATT_XRAY=$XRAY_BIN
+Environment=ATT_SCRIPT=$WEB_SCRIPT ATT_A_ENV=$STATE/a.env ATT_SVC=$SVC
 ExecStart=$(command -v python3) $WEB_PY
 Restart=always
 RestartSec=5
@@ -2362,6 +2498,7 @@ web_info(){
 }
 
 web_menu(){
+  [ -f "$STATE/a.env" ] && install_script_copy || true
   if systemctl is-active --quiet "$WEB_SVC" 2>/dev/null; then
     read -rp "面板运行中，关闭它？（输 yes）: " c
     [ "$c" = yes ] && web_disable || warn "未改动"
@@ -2569,6 +2706,7 @@ case "${1:-}" in
   --del|--delete|--remove) del_node "${2:-}" ;;
   --list)     show_exits ;;
   --exit-cmd) show_exit_cmd "${2:-}" ;;
+  --link)     [ -n "${2:-}" ] || die "用法：--link NAME"; show_links "$2" ;;
   --migrate)  migrate_cfg ;;
   --enable-stats) enable_stats ;;
   --web)      web_enable ;;
@@ -2576,5 +2714,5 @@ case "${1:-}" in
   --web-info) web_info ;;
   --version)  echo "att-tunnel v$VERSION" ;;
   "")         menu ;;
-  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --check | --links | --list | --add NAME | --del NAME | --exit-cmd NAME | --migrate | --enable-stats | --web | --web-off | --web-info）" ;;
+  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --check | --links | --list | --add NAME | --del NAME | --exit-cmd NAME | --link NAME | --migrate | --enable-stats | --web | --web-off | --web-info）" ;;
 esac
