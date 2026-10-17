@@ -1292,8 +1292,10 @@ del_node(){
   fi
 
   printf '%s\n' "$names" | grep -qxF "$name" || die "节点 $name 不存在"
-  # 入站至少要留一个 client，否则 Xray 校验不过；真要清空请走卸载
-  [ "$total" -gt 1 ] || die "这是最后一个节点，删掉入口就没人能用了。要停用请用菜单 11（卸载）"
+  # 允许删最后一个节点：主入口保留、clients 为空（xray -test 可通过），之后可再加节点
+  if [ "$total" -le 1 ]; then
+    warn "这是最后一个节点：删完后 A 端暂时没有可用节点，入口端口仍保留，之后可以再加节点"
+  fi
 
   local ptag; ptag=$(printf '%s\n' "$rows" | awk -F'\t' -v n="$name" '$1==n{print $2}')
   echo
@@ -1332,11 +1334,9 @@ for ib in d.get('inbounds',[]):
         keep=[c for c in cs if c.get('email')!=name]
         if len(keep)!=len(cs):
             found=True
-        if not keep:
-            # 额外入口（user-in-<端口>）空了就整个删掉；主入口必须留至少一个
-            if t!='user-in':
-                continue
-            raise SystemExit('LAST')
+        if not keep and t!='user-in':
+            # 额外入口（user-in-<端口>）空了就整个删掉；主入口保留（clients 可为空）
+            continue
         ib['settings']['clients']=keep
     ibs.append(ib)
 d['inbounds']=ibs
@@ -1489,9 +1489,8 @@ else:
 pin['listen']='127.0.0.1'
 st=pin.setdefault('settings',{}); st['auth']='password'; st['udp']=False
 old={a.get('user'):a.get('pass') for a in st.get('accounts',[]) if a.get('pass')}
+# 没有节点时 accounts 为空也合法（xray -test 通过），兜底规则把探测入口送进 blackhole
 st['accounts']=[{'user':'probe-'+n,'pass':old.get('probe-'+n) or secrets.token_hex(16)} for n in nodes]
-if not st['accounts']:
-    raise SystemExit('NONODE')
 obs=d.setdefault('outbounds',[])
 if not any(o.get('tag')=='probe-block' for o in obs):
     obs.append({'tag':'probe-block','protocol':'blackhole'})
