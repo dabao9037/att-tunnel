@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -1560,9 +1560,11 @@ import json
 import os
 import re
 import secrets
+import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -1583,6 +1585,12 @@ SESSION_TTL = 12 * 3600
 IP_SOURCES = [('api.ipify.org', '/'), ('icanhazip.com', '/'), ('ifconfig.me', '/ip')]
 NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,32}$')     # 与脚本 add_node 同一规则
 SNI_RE = re.compile(r'^[A-Za-z0-9.-]{1,253}$')
+# SSH 直装出口机：主机允许 IPv4 / 域名 / [IPv6]
+SSH_HOST_RE = re.compile(r'^[A-Za-z0-9._\-\[\]:]{3,253}$')
+SSH_USER_RE = re.compile(r'^[A-Za-z0-9._-]{1,32}$')
+# 从脚本输出里拆出来的出口机命令片段，写进远程命令前再校一次
+BRIDGE_URL_RE = re.compile(r"^https?://[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]{10,400}$")
+BRIDGE_TOKEN_RE = re.compile(r'^[A-Za-z0-9+/=_-]{8,4096}$')
 ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
 
 
@@ -1998,6 +2006,154 @@ def after_change(name=None):
         threading.Thread(target=probe_all, kwargs={'only': name}, daemon=True).start()
 
 
+# ---------------- SSH 直装出口机（可选） ----------------
+# 只用系统 ssh（+ sshpass 走密码），不引入任何 Python 第三方库。
+# 面板不保存任何 SSH 凭据：密码/私钥只在本次请求内用临时文件传给 ssh，用完即删。
+SSH_OPTS = ['-o', 'StrictHostKeyChecking=accept-new',
+            '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=15',
+            '-o', 'ServerAliveCountMax=8', '-o', 'NumberOfPasswordPrompts=1',
+            '-o', 'LogLevel=ERROR']
+# 注意：OpenSSH 里同名 -o 选项是「第一次出现的值生效」，所以 BatchMode /
+# PreferredAuthentications 不能先在公共参数里给一个默认值再在分支里覆盖，
+# 必须只在各自分支里给一次：
+#   私钥：BatchMode=yes，被拒就直接失败（不转去等密码，否则 stdin 被
+#          远程脚本占着，会一直挂到超时）
+#   密码：BatchMode=no，sshpass 靠接密码提示工作
+
+
+def have(cmd):
+    for d in ('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin'):
+        if os.path.isfile(os.path.join(d, cmd)):
+            return os.path.join(d, cmd)
+    return ''
+
+
+def split_exit_cmd(cmd):
+    """把脚本给出的出口机命令拆成 (raw_url, token)。
+
+    不直接把整条命令丢进远程 shell：那条命令是我们自己拼的，但经过 HTTP 往返后
+    再当 shell 代码执行，风险没必要承担。拆出两个字段各自严格校验，
+    远程只执行我们在这里重新拼的固定形状命令。
+    """
+    m = re.search(r'(https?://\S+?/install\.sh)', cmd)
+    t = re.search(r'--bridge\s+([A-Za-z0-9+/=_-]+)', cmd)
+    if not m or not t:
+        raise RuntimeError('解析出口机命令失败')
+    url, token = m.group(1), t.group(1)
+    if not BRIDGE_URL_RE.match(url) or not BRIDGE_TOKEN_RE.match(token):
+        raise RuntimeError('出口机命令里的地址或 token 不合规')
+    return url, token
+def ssh_install_bridge(host, port, user, password, key_text, exit_cmd, log_cb=None):
+    """到出口机上跑 att-tunnel --bridge <token>。返回 (rc, 输出)。
+
+    凭据只落临时文件（0600，用完删），不进命令行（ps 里看不到）、不写日志。
+    """
+    url, token = split_exit_cmd(exit_cmd)
+    sshbin = have('ssh')
+    if not sshbin:
+        return 127, '本机没有 ssh 客户端（装一下 openssh-client）'
+
+    # 远程只执行这一条固定形状的命令，url / token 已校验并再做一次 shell 转义
+    remote = ('set -e; export DEBIAN_FRONTEND=noninteractive; '
+              'cd /tmp; curl -fsSL %s -o att-bridge.sh; '
+              'ATT_NONINTERACTIVE=1 ATT_RAW_URL=%s bash att-bridge.sh --bridge %s; '
+              'rm -f att-bridge.sh'
+              % (shlex.quote(url), shlex.quote(url), shlex.quote(token)))
+
+    tmpdir = tempfile.mkdtemp(prefix='att-ssh-')
+    env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+           'HOME': '/root', 'LANG': 'C.UTF-8',
+           # 别让 ssh 去踩 agent / 默认私钥，也别弹任何图形密码框
+           'SSH_ASKPASS_REQUIRE': 'never', 'DISPLAY': ''}
+    cmd = [sshbin] + SSH_OPTS + ['-p', str(port),
+                                 '-o', 'UserKnownHostsFile=%s/known_hosts' % tmpdir]
+    try:
+        if key_text:
+            kp = os.path.join(tmpdir, 'id')
+            with open(kp, 'w') as fh:
+                fh.write(key_text if key_text.endswith('\n') else key_text + '\n')
+            os.chmod(kp, 0o600)
+            cmd += ['-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
+                    '-o', 'PreferredAuthentications=publickey', '-i', kp]
+        elif password:
+            sp = have('sshpass')
+            if not sp:
+                return 127, ('本机没有 sshpass，无法用密码登录。'
+                             '在 A 机跑 apt-get install -y sshpass 后重试，'
+                             '或改用私钥、或用一键代码自己装。')
+            pf = os.path.join(tmpdir, 'pw')
+            with open(pf, 'w') as fh:
+                fh.write(password)
+            os.chmod(pf, 0o600)
+            cmd += ['-o', 'BatchMode=no', '-o', 'PubkeyAuthentication=no',
+                    '-o', 'PreferredAuthentications=password,keyboard-interactive']
+            cmd = [sp, '-f', pf] + cmd
+        else:
+            return 400, '请填密码或私钥'
+
+        cmd += ['%s@%s' % (user, host), 'bash -s']
+        if log_cb:
+            log_cb('连接 %s@%s:%s …' % (user, host, port))
+        p = subprocess.run(cmd, input=remote, capture_output=True, text=True,
+                           timeout=900, env=env)
+        txt = ANSI_RE.sub('', (p.stdout or '') + (p.stderr or ''))
+        return p.returncode, txt.strip()[-6000:]
+    except subprocess.TimeoutExpired:
+        return 124, 'SSH 安装超时（900 秒），出口机上可能仍在跑，稍后看节点是否上线'
+    except OSError as e:
+        return 1, 'SSH 执行失败：%s' % e
+    finally:
+        for fn in ('id', 'pw', 'known_hosts'):
+            try:
+                os.remove(os.path.join(tmpdir, fn))
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+
+# SSH 安装任务：装出口机要跑几分钟，而面板经 hub 代理访问时代理只等 280s，
+# 同步做必然 504。所以丢后台线程跑，前端轮询 /api/ssh-status 看进度。
+ssh_jobs = {}
+SSH_JOB_TTL = 3600
+
+
+def ssh_job_new(node):
+    jid = secrets.token_urlsafe(12)
+    with lock:
+        t = now()
+        for k in [k for k, v in ssh_jobs.items() if v['done'] and t - v['ts'] > SSH_JOB_TTL]:
+            del ssh_jobs[k]
+        ssh_jobs[jid] = {'node': node, 'state': '正在连接…', 'log': '',
+                         'rc': None, 'done': False, 'ts': t}
+    return jid
+
+
+def ssh_job_set(jid, **kw):
+    with lock:
+        j = ssh_jobs.get(jid)
+        if j:
+            j.update(kw, ts=now())
+
+
+def ssh_job_run(jid, node, args):
+    """后台线程：在出口机上装 att-tunnel B 端。"""
+    try:
+        ssh_job_set(jid, state='正在连接出口机并安装（首次要装 xray，可能要几分钟）…')
+        rc, out = ssh_install_bridge(*args)
+        if rc == 0:
+            ssh_job_set(jid, state='安装完成，等隧道上线', log=out, rc=0, done=True)
+            threading.Thread(target=probe_all, kwargs={'only': node}, daemon=True).start()
+        else:
+            ssh_job_set(jid, state='安装失败（rc=%d）' % rc, log=out, rc=rc, done=True)
+    except Exception as e:
+        log('SSH 安装任务异常:', e)
+        ssh_job_set(jid, state='安装异常', log=str(e)[:2000], rc=1, done=True)
+
+
+
 sessions = {}   # sid -> {'exp': ts, 'csrf': token}
 fails = {}      # ip -> [失败时间戳]
 FAIL_WIN, FAIL_MAX = 600, 5
@@ -2107,6 +2263,17 @@ PAGE_MAIN += '''
 <label for="aPort">入口端口（留空 = 与主入口共用 <span id="defPort"></span>）</label><input id="aPort" name="port" inputmode="numeric" pattern="[0-9]{1,5}" placeholder="留空即可">
 <label for="aSni">伪装域名（只在单独端口时生效；共用端口时沿用主入口的 <span id="defSni"></span>）</label><select id="aSni" name="sni"></select>
 <div id="aCustW" hidden><label for="aCust">自定义域名（需支持 TLS 1.3）</label><input id="aCust" placeholder="www.example.com" autocomplete="off"></div>
+<hr style="border:none;border-top:1px solid var(--line);margin:16px 0 4px">
+<p class="mut" style="font-size:13px;margin:0 0 4px"><b>出口机（落地机）SSH—可不填</b><br>
+填了就直接 SSH 上去装；不填就只生成一键代码，你自己去跑。凭据只用于本次安装，面板不保存。</p>
+<label for="aSshHost">出口机 IP / 域名（留空 = 只生成一键代码）</label><input id="aSshHost" placeholder="如 1.2.3.4" autocomplete="off">
+<div id="aSshW" hidden>
+<div style="display:flex;gap:8px"><div style="flex:2"><label for="aSshUser">用户名</label><input id="aSshUser" value="root" autocomplete="off"></div>
+<div style="flex:1"><label for="aSshPort">SSH 端口</label><input id="aSshPort" value="22" inputmode="numeric" pattern="[0-9]{1,5}"></div></div>
+<label for="aSshPass">密码（有私钥就不用填）</label><input id="aSshPass" type="password" autocomplete="new-password">
+<label for="aSshKey">或贴私钥（与密码二选一，优先用私钥）</label>
+<textarea id="aSshKey" rows="3" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" autocomplete="off" style="width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:10px;background:var(--bg);font-family:ui-monospace,monospace;font-size:12px"></textarea>
+</div>
 <p class="mut" style="font-size:13px">添加会重启 att-tunnel，已有连接断开几秒。失败会自动回滚。</p></div>
 <div class="df"><button class="btn" type="button" data-close>取消</button><button class="btn p" type="submit" id="aGo">添加</button></div></form></dialog>
 <dialog id="dRes" aria-labelledby="dResH"><div class="dh" id="dResH">节点信息</div><div class="db" id="resB"></div>
@@ -2158,7 +2325,32 @@ function cp(t,b){(navigator.clipboard?navigator.clipboard.writeText(t):Promise.r
 function showRes(j,title){$("dResH").textContent=title;$("resB").innerHTML=`<label>客户端分享链接（导入后核对 flow=xtls-rprx-vision）</label><div class="copy"><span class="mono" id="rL"></span><button class="btn s" type="button" id="cL">复制</button></div>
 <label>到这个节点的出口机（B）上执行</label><div class="copy"><span class="mono" id="rC"></span><button class="btn s" type="button" id="cC">复制</button></div>
 <p class="err" style="font-size:13px">链接和命令含密钥，只在自己设备间使用。</p>`;$("rL").textContent=j.link;$("rC").textContent=j.exit_cmd;
-$("cL").onclick=()=>cp(j.link);$("cC").onclick=()=>cp(j.exit_cmd);$("dRes").showModal()}
+$("cL").onclick=()=>cp(j.link);$("cC").onclick=()=>cp(j.exit_cmd);
+if(j.ssh_job){const d=document.createElement("div");d.id="sshBox";
+  d.innerHTML='<label>SSH 直装出口机 '+esc(j.ssh_target||"")+'</label>'
+    +'<p class="mono" id="sshState" style="margin:4px 0">正在连接…</p>'
+    +'<pre class="out" id="sshOut" hidden></pre>'
+    +'<p class="mut" style="font-size:13px">装出口机首次要下 xray，可能要几分钟。关掉这个窗口也不会中断，上面的命令仍可备用。</p>';
+  $("resB").appendChild(d)}
+else if(j.ssh_error){const d=document.createElement("p");d.className="err";d.style.fontSize="13px";
+  d.textContent="SSH 安装没能开始："+j.ssh_error;$("resB").appendChild(d)}
+$("dRes").showModal()}
+async function pollSsh(job){
+  for(let i=0;i<200;i++){
+    await new Promise(r=>setTimeout(r,i<3?2000:5000));
+    let j;
+    try{j=await post("/api/ssh-status",{job})}catch(x){
+      const s=$("sshState");if(s)s.textContent="读取进度失败："+x.message;return}
+    const s=$("sshState");
+    if(s)s.textContent=j.state||"";
+    if(j.done){
+      const o=$("sshOut");
+      if(o&&j.output){o.hidden=false;o.textContent=j.output}
+      if(j.rc===0){toast("出口机 "+j.node+" 已装好","ok")}
+      else{toast("出口机安装失败，请用上面的一键代码手动装","bad")}
+      load();return}
+  }
+}
 document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>b.closest("dialog").close());
 $("list").addEventListener("click",async e=>{const b=e.target.closest("button[data-a]");if(!b)return;const a=b.dataset.a,n=b.dataset.n;
 try{if(a=="link"){if(!confirm("显示节点 "+n+" 的分享链接和出口机命令？\\n含密钥，注意身边没人看屏幕。"))return;b.disabled=true;showRes(await post("/api/link",{node:n}),"节点 "+n)}
@@ -2172,13 +2364,26 @@ try{await post("/api/del",{node:n,confirm:$("delIn").value});$("dDel").close();t
 finally{$("delGo").textContent="删除";load()}};
 $("aSni").innerHTML='<option value="">沿用主入口</option>'+SNIS.map(s=>`<option value="${esc(s[0])}">${esc(s[0])}（${esc(s[1])}）</option>`).join("")+'<option value="__c">自定义…</option>';
 $("aSni").onchange=()=>{$("aCustW").hidden=$("aSni").value!="__c"};
-$("bAdd").onclick=()=>{const m=D&&D.nodes[0];$("defPort").textContent=m?m.port:"";$("defSni").textContent=m?m.sni:"";$("fAdd").reset();$("aCustW").hidden=true;$("dAdd").showModal();$("aName").focus()};
+$("aSshHost").oninput=()=>{$("aSshW").hidden=!$("aSshHost").value.trim()};
+$("bAdd").onclick=()=>{const m=D&&D.nodes[0];$("defPort").textContent=m?m.port:"";$("defSni").textContent=m?m.sni:"";$("fAdd").reset();$("aCustW").hidden=true;$("aSshW").hidden=true;$("aSshUser").value="root";$("aSshPort").value="22";$("dAdd").showModal();$("aName").focus()};
 $("fAdd").onsubmit=async ev=>{ev.preventDefault();const name=$("aName").value.trim(),port=$("aPort").value.trim();let sni=$("aSni").value;if(sni=="__c")sni=$("aCust").value.trim();
 if(!/^[A-Za-z0-9_-]{1,32}$/.test(name)){toast("节点名只能用字母/数字/下划线/连字符，最多 32 位","bad");return}
 if(port&&!(/^[0-9]+$/.test(port)&&+port>=1&&+port<=65535)){toast("端口必须是 1-65535","bad");return}
 if(sni&&!/^[A-Za-z0-9.-]+$/.test(sni)){toast("域名格式不对","bad");return}
+const sshHost=$("aSshHost").value.trim(),sshUser=$("aSshUser").value.trim()||"root",
+  sshPort=$("aSshPort").value.trim()||"22",sshPass=$("aSshPass").value,sshKey=$("aSshKey").value.trim();
+if(sshHost){
+  if(!/^[A-Za-z0-9._\-\[\]:]{3,253}$/.test(sshHost)){toast("SSH 主机格式不对","bad");return}
+  if(!/^[A-Za-z0-9._-]{1,32}$/.test(sshUser)){toast("SSH 用户名格式不对","bad");return}
+  if(!(/^[0-9]+$/.test(sshPort)&&+sshPort>=1&&+sshPort<=65535)){toast("SSH 端口必须是 1-65535","bad");return}
+  if(!sshPass&&!sshKey){toast("填了 SSH 主机就要给密码或私钥","bad");return}
+}
 $("aGo").disabled=true;$("aGo").textContent="添加中…（约 10 秒）";
-try{const j=await post("/api/add",{name,port,sni});$("dAdd").close();toast("节点 "+name+" 已添加","ok");showRes(j,"新节点 "+name+" 已添加")}
+try{const j=await post("/api/add",{name,port,sni,ssh_host:sshHost,ssh_user:sshUser,
+  ssh_port:sshPort,ssh_pass:sshPass,ssh_key:sshKey});
+$("dAdd").close();toast("节点 "+name+" 已添加","ok");
+$("aSshPass").value="";$("aSshKey").value="";
+showRes(j,"新节点 "+name+" 已添加");if(j.ssh_job)pollSsh(j.ssh_job)}
 catch(x){fail("添加失败："+x.message,x.out)}finally{$("aGo").disabled=false;$("aGo").textContent="添加";load()}};
 $("bRef").onclick=load;
 $("bProbe").onclick=async e=>{const b=e.target;b.disabled=true;b.textContent="探测中…";try{await post("/api/probe",{});toast("探测完成","ok")}catch(x){toast(x.message,"bad")}b.disabled=false;b.textContent="立即探测";load()};
@@ -2310,6 +2515,15 @@ class H(http.server.BaseHTTPRequestHandler):
         if r == '/api/probe':
             probe_all(n or None)
             return self.jsend(200, {'ok': True})
+        if r == '/api/ssh-status':
+            jid = f.get('job', '')
+            with lock:
+                j = ssh_jobs.get(jid)
+                j = dict(j) if j else None
+            if not j:
+                return self.jsend(404, {'error': '任务不存在或已过期'})
+            return self.jsend(200, {'ok': True, 'node': j['node'], 'state': j['state'],
+                                    'rc': j['rc'], 'done': j['done'], 'output': j['log']})
         if r in ('/api/link', '/api/add', '/api/del') and not os.path.isfile(SCRIPT):
             return self.jsend(501, {'error': '面板未开启节点管理：请在 A 机重跑一次 --web'})
         if r == '/api/link':
@@ -2344,6 +2558,25 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.jsend(400, {'error': '伪装域名格式不对'})
         if name in node_names():
             return self.jsend(409, {'error': '节点 %s 已存在' % name})
+
+        # SSH 直装（可选）：填了主机就装，没填就只生成一键代码
+        sh = f.get('ssh_host', '').strip()
+        su = f.get('ssh_user', '').strip() or 'root'
+        sp = f.get('ssh_port', '').strip() or '22'
+        spw = f.get('ssh_pass', '')
+        skey = f.get('ssh_key', '')
+        if sh:
+            if not SSH_HOST_RE.match(sh):
+                return self.jsend(400, {'error': 'SSH 主机格式不对'})
+            if not SSH_USER_RE.match(su):
+                return self.jsend(400, {'error': 'SSH 用户名格式不对'})
+            if not (sp.isdigit() and 1 <= int(sp) <= 65535):
+                return self.jsend(400, {'error': 'SSH 端口必须是 1-65535'})
+            if not spw and not skey:
+                return self.jsend(400, {'error': '填了 SSH 主机就要给密码或私钥'})
+            if skey and 'PRIVATE KEY' not in skey:
+                return self.jsend(400, {'error': '私钥内容不像私钥（应包含 PRIVATE KEY）'})
+
         if not mut_lock.acquire(blocking=False):
             return self.jsend(409, {'error': '另一个加/删操作正在进行，请稍后'})
         try:
@@ -2354,11 +2587,25 @@ class H(http.server.BaseHTTPRequestHandler):
             mut_lock.release()
         if rc != 0:
             return self.jsend(500, {'error': '脚本返回 %d（配置未改动或已回滚）' % rc, 'output': out})
+
         try:
-            return self.jsend(200, dict(node_link(name), ok=True, output=out))
+            res = dict(node_link(name), ok=True, output=out)
         except Exception as e:
-            return self.jsend(200, {'ok': True, 'output': out, 'link': '（取链接失败：%s）' % e,
-                                    'exit_cmd': ''})
+            res = {'ok': True, 'name': name, 'output': out,
+                   'link': '（取链接失败：%s）' % e, 'exit_cmd': ''}
+
+        # 节点已建好。填了 SSH 就后台开装：装出口机要几分钟，
+        # 这一步不能卡在请求里（经 hub 代理时代理只等 280s）。
+        if sh and res.get('exit_cmd'):
+            jid = ssh_job_new(name)
+            args = (sh, int(sp), su, spw, skey, res['exit_cmd'])
+            threading.Thread(target=ssh_job_run, args=(jid, name, args),
+                             daemon=True).start()
+            res['ssh_job'] = jid
+            res['ssh_target'] = '%s@%s:%s' % (su, sh, sp)
+        elif sh:
+            res['ssh_error'] = '取不到出口机命令，没法 SSH 安装，请用下面的命令手动装'
+        return self.jsend(200, res)
 
 
 class Srv(http.server.ThreadingHTTPServer):
@@ -2430,6 +2677,18 @@ web_enable(){
   [ -f "$STATE/a.env" ] || die "网页面板只在 A 端（入口机）上用"
   command -v python3 >/dev/null || die "缺 python3"
   command -v flock >/dev/null || die "缺 flock（util-linux）"
+  # 面板「添加节点」可以填 SSH 直接装出口机：私钥用 ssh 就够，
+  # 密码登录要 sshpass。装不上不影响面板，只是密码那条路不可用。
+  command -v ssh >/dev/null || warn "本机没有 ssh 客户端，面板里的 SSH 直装出口机不可用"
+  if ! command -v sshpass >/dev/null; then
+    info "安装 sshpass（面板用 SSH 密码装出口机时需要）"
+    if command -v apt-get >/dev/null; then apt-get install -y -qq sshpass >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null; then dnf install -y -q sshpass >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null; then yum install -y -q sshpass >/dev/null 2>&1 || true
+    fi
+    command -v sshpass >/dev/null \
+      || warn "sshpass 没装上：面板里用密码 SSH 会提示不可用，改用私钥或一键代码即可"
+  fi
   stats_enabled || enable_stats
   stats_enabled || die "统计未启用，无法开面板"
   if [ ! -f "$WEB_ENV" ]; then
