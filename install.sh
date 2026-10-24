@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.4.0"
+VERSION="2.4.1"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -312,14 +312,57 @@ harden_service(){
 # A 侧必需：B 换 IP 后会留下一条僵死隧道，portal 仍会往里派流量，
 # 导致部分请求挂死。内核默认 tcp_retries2=15（约 15 分钟）太长，
 # 调到 5（约 20 秒）才能快速回收。实测：调之前 6/8，调之后 10/10。
+# 同时开 BBR：A↔B 是一条长 TCP 隧道，跨国线路偶发丢包时 cubic 会把窗口砍半、掉速很久，
+# BBR 按带宽和 RTT 估算发送速率，丢包时掉速小得多。内核 4.9+ 才有；不支持就跳过，不影响隧道。
+bbr_supported(){
+  grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null && return 0
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+  grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null
+}
+
 tune_tcp(){
-  local f=/etc/sysctl.d/99-att-tunnel.conf
-  cat > "$f" <<'EOF'
-# att-tunnel: 快速回收死掉的反向隧道连接（B 换 IP / 断网场景）
-net.ipv4.tcp_retries2 = 5
-EOF
-  sysctl -p "$f" >/dev/null 2>&1 && ok "已调优 tcp_retries2=5（僵死隧道 ~20s 回收）" \
+  local f=/etc/sysctl.d/99-att-tunnel.conf bbr=0
+  bbr_supported && bbr=1
+  {
+    echo "# att-tunnel: 快速回收死掉的反向隧道连接（B 换 IP / 断网场景）"
+    echo "net.ipv4.tcp_retries2 = 5"
+    if [ "$bbr" = 1 ]; then
+      echo "# att-tunnel: BBR 拥塞控制 + fq 队列（丢包时不像 cubic 那样大幅掉速）"
+      echo "net.core.default_qdisc = fq"
+      echo "net.ipv4.tcp_congestion_control = bbr"
+    fi
+  } > "$f"
+  # 开机自动加载 bbr 模块（编进内核的不需要，写了也无害）
+  [ "$bbr" = 1 ] && [ -d /etc/modules-load.d ] && echo tcp_bbr > /etc/modules-load.d/att-tunnel-bbr.conf
+  # 逐项生效：容器里 default_qdisc 可能不让改，不能连累其它项
+  sysctl -w net.ipv4.tcp_retries2=5 >/dev/null 2>&1 && ok "已调优 tcp_retries2=5（僵死隧道 ~20s 回收）" \
     || warn "sysctl 应用失败，僵死连接回收会变慢"
+  if [ "$bbr" = 1 ]; then
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    if sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+      ok "已开启 BBR（新建连接生效；隧道下次重连起用 BBR）"
+    else
+      warn "BBR 设置失败（容器 / 受限内核），沿用 $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    fi
+  else
+    warn "内核不支持 BBR（$(uname -r)），沿用 $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  fi
+}
+
+# 老机器单独补调优（不重装、不动配置和节点）：--tune
+tune_only(){
+  need_root
+  tune_tcp
+  local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  if [ "$cc" = bbr ] && systemctl is-active --quiet "$SVC" && [ -f "$STATE/b.env" ]; then
+    # 隧道是 B 拨出去的长连接，建连时定下拥塞算法；重启让它立刻换成 BBR，断几秒自动重连
+    if noninteractive || [ "${ATT_YES:-}" = 1 ]; then
+      systemctl restart "$SVC" && ok "已重启 $SVC，隧道已用 BBR 重连"
+    else
+      read -rp "重启 $SVC 让现有隧道立刻改用 BBR？会断几秒 [y/N]: " yn
+      case "$yn" in [yY]*) systemctl restart "$SVC" && ok "已重启 $SVC，隧道已用 BBR 重连" ;; *) info "不重启：隧道下次重连时自动用 BBR" ;; esac
+    fi
+  fi
 }
 
 open_fw(){
@@ -2835,6 +2878,11 @@ web_menu(){
 }
 
 # ================= 自检 =================
+check_bbr(){
+  local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  [ "$cc" = bbr ] && ok "拥塞控制 BBR" || warn "拥塞控制是 ${cc:-未知}，建议 BBR：bash install.sh --tune"
+}
+
 selfcheck(){
   echo "${BLD}--- 运行自检 ---${RST}"
   if systemctl is-active --quiet "$SVC"; then ok "$SVC active"; else echo "${RED}[X]${RST} $SVC 未运行"; fi
@@ -2902,6 +2950,7 @@ selfcheck(){
     fi
     local r2; r2=$(sysctl -n net.ipv4.tcp_retries2 2>/dev/null)
     [ "$r2" = 5 ] && ok "tcp_retries2=5（僵死隧道快速回收）" || warn "tcp_retries2=$r2，建议为 5"
+    check_bbr
     echo; info "逐个节点验收：连上后查出口 IP，必须等于${BLD}它对应那台出口机的实时公网 IP${RST}"
     info "如果显示的是 A 的 IP（$A_IP），说明该节点的流量没进 portal"
     info "如果两个节点查出同一个出口 IP，说明它们共用了出口，不是 1:1"
@@ -2916,6 +2965,7 @@ selfcheck(){
     local listen; listen=$(ss -ltn 2>/dev/null | grep -vE '127.0.0.1|::1|State' | wc -l)
     ok "对外监听端口数（含 SSH）: $listen"
     grep -q '"inbounds": \[\]' "$CFG" && ok "B 无任何用户入站（零暴露）" || warn "B 端出现了 inbound，与设计不符"
+    check_bbr
     echo -n "本机实时公网 IP: "; pubip; echo
   else
     warn "未找到部署状态，尚未部署"
@@ -3028,6 +3078,7 @@ case "${1:-}" in
   --bridge)   need_root; deploy_b "${2:-}" ;;
   --server-a) deploy_a ;;
   --check)    selfcheck ;;
+  --tune)     tune_only ;;
   --links)    show_links ;;
   --add)      add_node "${2:-}" ;;
   --del|--delete|--remove) del_node "${2:-}" ;;
@@ -3041,5 +3092,5 @@ case "${1:-}" in
   --web-info) web_info ;;
   --version)  echo "att-tunnel v$VERSION" ;;
   "")         menu ;;
-  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --check | --links | --list | --add NAME | --del NAME | --exit-cmd NAME | --link NAME | --migrate | --enable-stats | --web | --web-off | --web-info）" ;;
+  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --check | --tune | --links | --list | --add NAME | --del NAME | --exit-cmd NAME | --link NAME | --migrate | --enable-stats | --web | --web-off | --web-info）" ;;
 esac
