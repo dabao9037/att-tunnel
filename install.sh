@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.4.1"
+VERSION="2.5.0"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -366,24 +366,24 @@ tune_only(){
 }
 
 open_fw(){
-  local p="$1" done_any=0
+  local p="$1" pr="${2:-tcp}" done_any=0
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    ufw allow "$p/tcp" >/dev/null 2>&1 && { ok "ufw 已放行 $p/tcp"; done_any=1; }
+    ufw allow "$p/$pr" >/dev/null 2>&1 && { ok "ufw 已放行 $p/$pr"; done_any=1; }
   fi
   if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="$p/tcp" >/dev/null 2>&1
-    firewall-cmd --reload >/dev/null 2>&1 && { ok "firewalld 已放行 $p/tcp"; done_any=1; }
+    firewall-cmd --permanent --add-port="$p/$pr" >/dev/null 2>&1
+    firewall-cmd --reload >/dev/null 2>&1 && { ok "firewalld 已放行 $p/$pr"; done_any=1; }
   fi
   # 很多 VPS 没有 ufw/firewalld，但 iptables INPUT 默认 DROP 或有拦截规则。
   # 上一版只看 ufw/firewalld，所以反代端口实际被 iptables 拦掉。
   if command -v iptables >/dev/null 2>&1; then
     local pol; pol=$(iptables -L INPUT -n 2>/dev/null | sed -n 1p)
     if echo "$pol" | grep -q 'policy DROP' || iptables -L INPUT -n 2>/dev/null | grep -qE '^(DROP|REJECT)'; then
-      if ! iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; then
-        iptables -I INPUT 1 -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
-          && { ok "iptables 已放行 $p/tcp"; done_any=1; }
+      if ! iptables -C INPUT -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null; then
+        iptables -I INPUT 1 -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null \
+          && { ok "iptables 已放行 $p/$pr"; done_any=1; }
       else
-        ok "iptables 已有 $p/tcp 放行规则"; done_any=1
+        ok "iptables 已有 $p/$pr 放行规则"; done_any=1
       fi
       # 尽力持久化
       if command -v netfilter-persistent >/dev/null 2>&1; then
@@ -394,7 +394,170 @@ open_fw(){
     fi
   fi
   [ "$done_any" = 1 ] || warn "本机未发现防火墙拦截"
-  warn "❗ 云厂商安全组需你自己在控制台放行 $p/tcp（脚本改不了）"
+  warn "❗ 云厂商安全组需你自己在控制台放行 $p/$pr（脚本改不了）"
+}
+
+# ================= WireGuard 出口（可选，加节点时逐个选） =================
+# 方向和 VLESS 反向一样：落地机（B）主动拨 A 的 UDP 口 + PersistentKeepalive，B 照样零公网入站。
+#   A：一个接口 attwg（随机 UDP 端口），每个 WG 节点一个 peer、一个隧道 IP（/32），严格 1:1。
+#   B：wg 只认 A 这一个 peer；B 上的 Xray 只在自己的隧道 IP 上听一个 VLESS 口。
+#   A 的 Xray：user:[节点] -> outbound wgx-<节点>（VLESS 到 B 的隧道 IP），流量从 B 出网。
+# 和 VLESS 反向的区别：用户的每条连接各自一条 TCP（跑在 WG/UDP 里），不挤在一条长 TCP 隧道里，
+# 线路丢包时不会一条卡住全部。分享链接、订阅、出口探测、流量统计和反向节点完全一样。
+# 状态：A 端 $STATE/wg.json（密钥、端口、每个节点的 peer），/etc/wireguard/attwg.conf 由它生成。
+WG_IF="attwg"
+WG_CONF="/etc/wireguard/$WG_IF.conf"
+WG_STATE="$STATE/wg.json"
+WG_DROPIN="/etc/systemd/system/$SVC.service.d/10-att-wg.conf"
+
+wg_tools(){
+  command -v wg >/dev/null && command -v wg-quick >/dev/null && return 0
+  info "安装 wireguard-tools ..."
+  if command -v apt-get >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends wireguard-tools >/dev/null 2>&1 \
+      || { apt-get update -qq >/dev/null 2>&1 \
+           && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends wireguard-tools >/dev/null 2>&1; } \
+      || true
+  elif command -v dnf >/dev/null; then dnf install -y -q wireguard-tools >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null; then yum install -y -q wireguard-tools >/dev/null 2>&1 || true
+  fi
+  command -v wg >/dev/null && command -v wg-quick >/dev/null
+}
+
+# 内核能不能建 wireguard 接口（5.6+ 自带；OpenVZ / LXC 容器一般不行）
+wg_kmod(){
+  modprobe wireguard >/dev/null 2>&1 || true
+  ip link del attwg-chk >/dev/null 2>&1 || true
+  ip link add attwg-chk type wireguard >/dev/null 2>&1 || return 1
+  ip link del attwg-chk >/dev/null 2>&1 || true
+}
+
+wg_require(){
+  wg_tools || die "wireguard-tools 装不上（apt/dnf/yum 都失败），这个节点请改用 VLESS 反向"
+  wg_kmod || die "本机内核不支持 WireGuard（OpenVZ/LXC 容器常见），这个节点请改用 VLESS 反向"
+}
+
+free_udp_port(){
+  local p
+  while :; do
+    p=$(( RANDOM % 40000 + 20000 ))
+    ss -lun 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p\$" || { echo "$p"; return; }
+  done
+}
+
+# A 端 wg.json 的读写。密钥一律走环境变量（WG_PRIV/WG_PUB/WGP_*），不进命令行。
+#   init PORT NET | alloc NAME [保留节点...] | put NAME IP [保留节点...] | del NAME
+#   get KEY | get NAME KEY | conf（输出 attwg.conf）
+wg_state(){
+  ATT_WG_STATE="$WG_STATE" python3 - "$@" <<'PY'
+import ipaddress,json,os,sys
+f=os.environ['ATT_WG_STATE']; a=sys.argv[1:]; act=a[0]; E=os.environ.get
+def load():
+    with open(f) as h: return json.load(h)
+def save(d):
+    tmp=f+'.tmp'
+    fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+    with os.fdopen(fd,'w') as h: json.dump(d,h,indent=1)
+    os.replace(tmp,f)
+if act=='init':
+    save({'port':int(a[1]),'net':a[2],'priv':E('WG_PRIV'),'pub':E('WG_PUB'),'peers':{}})
+elif act=='alloc':
+    # 给 NAME 挑隧道 IP；不在保留列表里的残留 peer（加节点中途失败留下的）不占位
+    d=load(); name=a[1]; keep=set(a[2:])
+    used={p['ip'] for n,p in d['peers'].items() if n in keep and n!=name}
+    for i in range(2,255):
+        ip='%s.%d'%(d['net'],i)
+        if ip not in used:
+            print(ip); break
+    else:
+        sys.exit('FULL')
+elif act=='put':
+    d=load(); name,ip=a[1],a[2]; keep=set(a[3:])|{name}
+    d['peers']={n:p for n,p in d['peers'].items() if n in keep}
+    d['peers'][name]={'ip':ip,'xport':int(E('WGP_XPORT')),'priv':E('WGP_PRIV'),'pub':E('WGP_PUB'),
+                      'psk':E('WGP_PSK'),'uuid':E('WGP_UUID')}
+    save(d)
+elif act=='del':
+    d=load(); d['peers'].pop(a[1],None); save(d)
+elif act=='get':
+    d=load()
+    v=d.get(a[1]) if len(a)==2 else (d['peers'].get(a[1]) or {}).get(a[2])
+    if v is None or isinstance(v,dict): sys.exit(1)
+    print(v)
+elif act=='conf':
+    d=load()
+    out=['# att-tunnel 生成，别手改：以 %s 为准，加/删 WireGuard 节点时重写'%f,
+         '[Interface]','Address = %s.1/24'%d['net'],'ListenPort = %d'%d['port'],'PrivateKey = %s'%d['priv']]
+    for n,p in sorted(d['peers'].items(), key=lambda x: ipaddress.ip_address(x[1]['ip'])):
+        out+=['','# node: %s'%n,'[Peer]','PublicKey = %s'%p['pub'],'PresharedKey = %s'%p['psk'],
+              'AllowedIPs = %s/32'%p['ip']]
+    print('\n'.join(out))
+else:
+    sys.exit('bad action')
+PY
+}
+
+# 按 wg.json 重写 attwg.conf 并生效：接口已在就 syncconf 热更新（不断其它落地机），不在就拉起
+wg_apply(){
+  mkdir -p /etc/wireguard; chmod 700 /etc/wireguard
+  local tmp; tmp=$(mktemp)
+  wg_state conf > "$tmp" || { rm -f "$tmp"; die "生成 WireGuard 配置失败"; }
+  install -m 600 "$tmp" "$WG_CONF"; rm -f "$tmp"
+  systemctl enable "wg-quick@$WG_IF" >/dev/null 2>&1 || true
+  if ip link show "$WG_IF" >/dev/null 2>&1; then
+    wg syncconf "$WG_IF" <(wg-quick strip "$WG_CONF") || die "WireGuard 配置热更新失败"
+  else
+    systemctl restart "wg-quick@$WG_IF" || {
+      journalctl -u "wg-quick@$WG_IF" -n 10 --no-pager 2>&1 | tail -8
+      die "WireGuard 接口 $WG_IF 起不来"; }
+  fi
+  ip link show "$WG_IF" >/dev/null 2>&1 || die "WireGuard 接口 $WG_IF 没起来"
+}
+
+# A 端：第一次加 WireGuard 节点时初始化（密钥 + 随机 UDP 口），之后只确保接口在
+wg_server_ensure(){
+  wg_require
+  if [ ! -s "$WG_STATE" ]; then
+    local port="${ATT_WG_PORT:-}" net="${ATT_WG_NET:-10.77.0}" priv pub
+    [ -n "$port" ] || port=$(free_udp_port)
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "ATT_WG_PORT 不对：$port"
+    [[ "$net" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || die "ATT_WG_NET 要写成三段，如 10.77.0"
+    priv=$(wg genkey); pub=$(printf '%s' "$priv" | wg pubkey)
+    mkdir -p "$STATE"
+    WG_PRIV="$priv" WG_PUB="$pub" wg_state init "$port" "$net"
+    ok "WireGuard 已初始化：UDP $port，隧道网段 $net.0/24"
+  fi
+  wg_apply
+  open_fw "$(wg_state get port)" udp || true
+}
+
+# 打印某个 WireGuard 节点的落地机部署命令（token 含落地机私钥，等同隧道密钥）
+print_wg_cmd(){
+  local name="$1"
+  # shellcheck disable=SC1090
+  source "$STATE/a.env"
+  [ -s "$WG_STATE" ] || die "本机还没有 WireGuard 节点"
+  local ip; ip=$(wg_state get "$name" ip) || die "WireGuard 里没有节点 $name 的记录（跑菜单 8 自检）"
+  local token
+  token=$(printf 'wg1|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$A_IP" "$(wg_state get port)" "$(wg_state get pub)" \
+    "$(wg_state get "$name" priv)" "$(wg_state get "$name" psk)" "$ip" "$(wg_state get net).1" \
+    "$(wg_state get "$name" xport)" "$(wg_state get "$name" uuid)" | base64 -w0)
+  echo
+  echo "${BLD}到这个节点的落地机${name:+（$name，WireGuard）}上执行：${RST}"
+  echo
+  echo "${GRN}bash <(curl -fsSL $RAW_URL) --wg-bridge $token${RST}"
+  echo
+  echo "${YEL}这串 token 含 WireGuard 私钥，只在你自己两台机器间使用，不要外发。${RST}"
+}
+
+# 落地机从 WireGuard 改回 VLESS 反向：只停/移走 att-tunnel 自己的 attwg，不碰别的 wg 接口
+wg_b_off(){
+  if [ -f "$WG_CONF" ] && grep -q '^# att-tunnel' "$WG_CONF" 2>/dev/null; then
+    systemctl disable --now "wg-quick@$WG_IF" >/dev/null 2>&1 || true
+    mv "$WG_CONF" "$WG_CONF.bak-$(date +%Y%m%d%H%M%S)"
+    ok "已停用本机原来的 WireGuard 出口（$WG_IF）"
+  fi
+  rm -f "$WG_DROPIN"
 }
 
 # ================= 服务器 A：用户入口 + portal =================
@@ -641,10 +804,14 @@ deploy_b(){
 
   local dec aip rport buuid enc tstyle
   dec=$(echo "$token" | base64 -d 2>/dev/null) || die "token 解析失败"
+  # WireGuard 出口的 token（菜单 2 粘贴时自动识别）
+  case "$dec" in wg1\|*) deploy_wg_b "$token"; return ;; esac
   IFS='|' read -r aip rport buuid enc tstyle <<<"$dec"
   [ -n "$aip" ] && [ -n "$rport" ] && [ -n "$buuid" ] && [ -n "$enc" ] || die "token 内容不完整"
 
   install_deps; install_xray
+  # 这台落地机之前若是 WireGuard 出口，先停掉它自己的 attwg
+  wg_b_off
 
   # A/B 两端都强制同一个 $XRAY_VER，语法必然一致。若 token 带的 style 不一致，
   # 说明 A 端是用旧版本部署的，必须让 A 也重跑一次，否则握手会失败
@@ -779,6 +946,122 @@ EOF
   warn "如需把 SSH 迁到高位端口（降低暴露面），单独跑：菜单 10"
 }
 
+# ================= 服务器 B：WireGuard 出口 =================
+# token = base64(wg1|A公网IP|A的UDP口|A公钥|B私钥|预共享密钥|B隧道IP|A隧道IP|B的Xray口|uuid)
+# B 主动拨 A（PersistentKeepalive），公网零入站；Xray 只听在自己的隧道 IP 上，WG 只认 A 一个 peer。
+deploy_wg_b(){
+  need_root
+  local token="${1:-}"
+  [ -n "$token" ] || die "缺少 token，请用 A 端输出的完整命令"
+  [ -f "$STATE/a.env" ] && die "本机是 A 端（入口机），不能同时当落地机"
+  local dec ver aip wport apub bpriv psk bip ain xport uuid
+  dec=$(printf '%s' "$token" | base64 -d 2>/dev/null) || die "token 解析失败"
+  IFS='|' read -r ver aip wport apub bpriv psk bip ain xport uuid <<<"$dec"
+  [ "$ver" = wg1 ] || die "这不是 WireGuard 出口的 token（VLESS 反向用 --bridge）"
+  local k='^[A-Za-z0-9+/]{43}=$' i4='^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+  [[ "$aip" =~ ^[A-Za-z0-9.:-]{2,253}$ ]] && [[ "$wport" =~ ^[0-9]{1,5}$ ]] && [[ "$xport" =~ ^[0-9]{1,5}$ ]] \
+    && [[ "$apub" =~ $k ]] && [[ "$bpriv" =~ $k ]] && [[ "$psk" =~ $k ]] \
+    && [[ "$bip" =~ $i4 ]] && [[ "$ain" =~ $i4 ]] && [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] \
+    || die "token 内容不完整或格式不对"
+
+  install_deps; install_xray; wg_require
+  info "将用 WireGuard 主动拨向 A: $aip:$wport/udp（本机隧道 IP $bip）"
+
+  mkdir -p /etc/wireguard; chmod 700 /etc/wireguard
+  if [ -f "$WG_CONF" ] && ! grep -q '^# att-tunnel' "$WG_CONF"; then
+    die "$WG_CONF 已存在且不是 att-tunnel 生成的，没动它"
+  fi
+  local ep="$aip"; [[ "$aip" == *:* ]] && ep="[$aip]"
+  local wtmp; wtmp=$(mktemp)
+  cat > "$wtmp" <<EOF
+# att-tunnel 落地机（WireGuard 出口），由 --wg-bridge 生成，重跑会覆盖
+[Interface]
+Address = $bip/32
+PrivateKey = $bpriv
+
+[Peer]
+PublicKey = $apub
+PresharedKey = $psk
+Endpoint = $ep:$wport
+AllowedIPs = $ain/32
+PersistentKeepalive = 15
+EOF
+  install -m 600 "$wtmp" "$WG_CONF"; rm -f "$wtmp"
+  systemctl enable "wg-quick@$WG_IF" >/dev/null 2>&1 || true
+  systemctl restart "wg-quick@$WG_IF" || {
+    journalctl -u "wg-quick@$WG_IF" -n 10 --no-pager 2>&1 | tail -8
+    die "WireGuard 接口 $WG_IF 起不来"; }
+  # Xray 要听在隧道 IP 上：开机时必须等 attwg 起来再启动
+  mkdir -p "$(dirname "$WG_DROPIN")"
+  printf '[Unit]\nAfter=wg-quick@%s.service\nWants=wg-quick@%s.service\n' "$WG_IF" "$WG_IF" > "$WG_DROPIN"
+
+  local tmp; tmp=$(mktemp --suffix=.json)
+  cat > "$tmp" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "wg-in",
+      "listen": "$bip",
+      "port": $xport,
+      "protocol": "vless",
+      "settings": { "clients": [ { "id": "$uuid", "email": "wg" } ], "decryption": "none" },
+      "streamSettings": { "network": "raw" }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "freedom",
+      "protocol": "freedom",
+      "settings": {
+        "finalRules": [
+          { "action": "block", "ip": [ "geoip:private" ] },
+          { "action": "allow" }
+        ]
+      },
+      "streamSettings": { "sockopt": { "domainStrategy": "UseIPv4" } }
+    }
+  ]
+}
+EOF
+  apply_cfg "$tmp"
+  tune_tcp
+  # INPUT 默认 DROP 的机器：放行从隧道进来的这一个端口（只认 attwg 接口，公网照样扫不到）
+  if command -v iptables >/dev/null 2>&1 && { iptables -L INPUT -n 2>/dev/null | sed -n 1p | grep -q 'policy DROP' \
+       || iptables -L INPUT -n 2>/dev/null | grep -qE '^(DROP|REJECT)'; }; then
+    iptables -C INPUT -i "$WG_IF" -p tcp --dport "$xport" -j ACCEPT 2>/dev/null \
+      || iptables -I INPUT 1 -i "$WG_IF" -p tcp --dport "$xport" -j ACCEPT 2>/dev/null || true
+    if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null 2>&1 || true
+    elif [ -d /etc/iptables ]; then iptables-save > /etc/iptables/rules.v4 2>/dev/null || true; fi
+  fi
+
+  mkdir -p "$STATE"
+  printf 'ROLE=B\nKIND=wg\nA_IP=%s\nWG_PORT=%s\nTUN_IP=%s\n' "$aip" "$wport" "$bip" > "$STATE/b.env"
+  chmod 600 "$STATE/b.env"
+
+  echo
+  info "等待 WireGuard 握手 ..."
+  local i hs=0
+  for i in $(seq 1 15); do
+    hs=$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk '{print $2}' | sed -n 1p) || hs=0
+    [ "${hs:-0}" -gt 0 ] 2>/dev/null && break
+    sleep 2
+  done
+  echo
+  echo "${BLD}=========== 落地机（WireGuard 出口）部署完成 ===========${RST}"
+  if [ "${hs:-0}" -gt 0 ] 2>/dev/null; then
+    ok "WireGuard 已握手（B → A $aip:$wport/udp）"
+  else
+    echo "${YEL}${BLD}⚠ WireGuard 还没握手${RST}"
+    echo "本机会每 15 秒重试。最常见的原因：${BLD}A 机的 $wport/udp 没对外开放${RST}"
+    echo "去 A 机的云厂商安全组放行 ${BLD}$wport/udp${RST}（入方向），放行后不用重跑。"
+    echo "确认方法：${CYN}wg show $WG_IF latest-handshakes${RST}（第二列不是 0 就通了）"
+  fi
+  echo
+  ok "落地机公网无入站监听（Xray 只听在隧道 IP $bip 上）"
+  ok "落地机换 IP 无需任何操作，WireGuard 会自动重拨"
+}
+
 # ================= 节点 / 出口机 管理 =================
 # 架构：一个节点 = 一台出口机 = 一个 portal 标签（严格 1:1）
 #   A 端 reverse-in 挂多个 bridge client，每个带自己的 reverse.tag
@@ -786,8 +1069,9 @@ EOF
 # B 端无需任何改动：它只认 token 里的 uuid，一台 B 一个 uuid 天然分开，
 # 多台 B 复用同一个反代端口没问题。
 
-# 输出：节点名 <TAB> portal标签 <TAB> 出口uuid（一行一个节点）
-# portal 标签或 uuid 为空 = 该节点没有绑定出口机
+# 输出：节点名 <TAB> 出口标签 <TAB> 出口uuid（一行一个节点）
+# 出口标签：portal-<节点> = VLESS 反向；wgx-<节点> = WireGuard
+# 出口标签或 uuid 为空 = 该节点没有绑定出口机
 list_exits(){
   [ -f "$CFG" ] || return 1
   ATT_CFG="$CFG" python3 - <<'PY'
@@ -803,11 +1087,17 @@ for ib in d.get('inbounds',[]):
             t=(c.get('reverse') or {}).get('tag')
             if t:
                 bridges[t]=c.get('id','')
+# WireGuard 出口：outbound wgx-<节点>（VLESS 到落地机的隧道 IP），uuid 在 settings.id
+for ob in d.get('outbounds',[]):
+    t=str(ob.get('tag',''))
+    if t.startswith('wgx-'):
+        st=ob.get('settings') or {}
+        bridges[t]=st.get('id') or ((st.get('vnext') or [{}])[0].get('users') or [{}])[0].get('id','')
 node2portal={}
 for r in d.get('routing',{}).get('rules',[]):
     ot=r.get('outboundTag','')
     # probe-in 的探测规则（user=probe-<节点>）不是节点规则
-    if ot.startswith('portal') and 'probe-in' not in (r.get('inboundTag') or []):
+    if (ot.startswith('portal') or ot.startswith('wgx-')) and 'probe-in' not in (r.get('inboundTag') or []):
         for u in r.get('user',[]):
             node2portal[u]=ot
 for ib in d.get('inbounds',[]):
@@ -848,6 +1138,11 @@ for ib in d.get('inbounds',[]):
 dup=sorted({t for t in bridge_tags if bridge_tags.count(t)>1})
 for t in dup:
     err.append('portal 标签重复: %s（流量会在多条隧道间随机派发）'%t)
+wg_tags=[str(o.get('tag','')) for o in d.get('outbounds',[]) if str(o.get('tag','')).startswith('wgx-')]
+for t in sorted({t for t in wg_tags if wg_tags.count(t)>1}):
+    err.append('WireGuard 出口标签重复: %s'%t)
+exit_tags=set(bridge_tags)|set(wg_tags)
+def is_exit(t): return t.startswith('portal') or t.startswith('wgx-')
 
 nodes=[]
 ports={}
@@ -868,15 +1163,15 @@ for r in d.get('routing',{}).get('rules',[]):
     ot=r.get('outboundTag','')
     # 按 inboundTag 区分：probe-in 的是出口探测规则（user=probe-<节点>），单独校验
     if 'probe-in' in (r.get('inboundTag') or []):
-        if ot.startswith('portal') and ot not in bridge_tags:
-            err.append('探测路由指向不存在的 portal 标签: %s'%ot)
+        if is_exit(ot) and ot not in exit_tags:
+            err.append('探测路由指向不存在的出口标签: %s'%ot)
         for u in r.get('user',[]):
             probe2portal[u]=ot
         continue
-    if not ot.startswith('portal'):
+    if not is_exit(ot):
         continue
-    if ot not in bridge_tags:
-        err.append('路由指向不存在的 portal 标签: %s'%ot)
+    if ot not in exit_tags:
+        err.append('路由指向不存在的出口标签: %s'%ot)
     for u in r.get('user',[]):
         if u not in nodes:
             err.append('路由里有悬空用户: %s（入站里没这个节点）'%u)
@@ -1052,7 +1347,7 @@ show_links(){
     if [ -z "$ptag" ]; then
       tip="  ${RED}未绑定出口机（流量会从 A 出网，泄露 A 的 IP）${RST}"
     else
-      tip="  出口：${CYN}$ptag${RST}"
+      case "$ptag" in wgx-*) tip="  出口：${CYN}$ptag${RST}（WireGuard）" ;; *) tip="  出口：${CYN}$ptag${RST}" ;; esac
     fi
     local link="vless://$uuid@$A_IP:${np:-$uport}?encryption=none&security=reality&$qs&sni=${ns:-$SNI}&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID#$n"
     # --link NAME：只输出这一条链接（给面板用）
@@ -1115,6 +1410,21 @@ add_node(){
     || die "名称只能用字母/数字/下划线/连字符，最多 32 位"
   list_nodes 2>/dev/null | grep -qxF "$name" && die "节点 $name 已存在（原配置未改动）"
 
+  # 出口方式：ATT_NODE_KIND=reverse（VLESS 反向，默认）| wg（WireGuard）
+  local kind="${ATT_NODE_KIND:-}"
+  if [ -z "$kind" ] && ! noninteractive; then
+    echo "出口方式："
+    echo "  1) VLESS 反向（默认，落地机经一条 TCP 长连接拨入）"
+    echo "  2) WireGuard（落地机经 UDP 拨入，每条连接各走各的，线路丢包时不互相拖累）"
+    read -rp "选择 [1]: " kind
+  fi
+  case "${kind:-1}" in
+    1|reverse|vless) kind=reverse ;;
+    2|wg|wireguard)  kind=wg ;;
+    *) die "出口方式只能是 reverse 或 wg：$kind" ;;
+  esac
+  [ "$kind" = wg ] && [ "${REVERSE_STYLE:-new}" != new ] && die "本机 Xray 是旧版 reverse 语法，WireGuard 出口不可用，请改用 VLESS 反向"
+
   # 入口端口：ATT_NODE_PORT > 交互输入 > 主入口端口
   local uport="${ATT_NODE_PORT:-}"
   if [ -z "$uport" ] && ! noninteractive; then
@@ -1163,16 +1473,27 @@ for ib in d.get("inbounds",[]):
   uuid=$("$XRAY_BIN" uuid)    # 客户端用
   buuid=$("$XRAY_BIN" uuid)   # 这个节点专属出口机用
 
+  # WireGuard：先确保 A 端 attwg 接口在，再给这个节点分一个隧道 IP 和落地机上的 Xray 端口
+  local wgip="" wgx=""
+  if [ "$kind" = wg ]; then
+    wg_server_ensure
+    # shellcheck disable=SC2046
+    wgip=$(wg_state alloc "$name" $(list_nodes 2>/dev/null)) || die "WireGuard 隧道 IP 已用完（最多 253 个节点）"
+    wgx=$(( RANDOM % 40000 + 20000 ))
+  fi
+
   local tmp; tmp=$(mktemp --suffix=.json)
   local rc=0
   NEW_NAME="$name" NEW_UUID="$uuid" NEW_BUUID="$buuid" NEW_PORT="$uport" NEW_SNI="$nsni" \
+    NEW_KIND="$kind" NEW_WGIP="$wgip" NEW_WGX="$wgx" \
     ATT_CFG="$CFG" python3 - > "$tmp" <<'PY' || rc=$?
 import copy,json,os
 d=json.load(open(os.environ['ATT_CFG']))
 name=os.environ['NEW_NAME']
 uuid=os.environ['NEW_UUID']; buuid=os.environ['NEW_BUUID']
 port=int(os.environ['NEW_PORT']); sni=os.environ['NEW_SNI']
-ptag='portal-%s'%name
+kind=os.environ.get('NEW_KIND','reverse')
+ptag=('wgx-%s' if kind=='wg' else 'portal-%s')%name
 def is_ui(ib):
     t=str(ib.get('tag',''))
     return t=='user-in' or t.startswith('user-in-')
@@ -1208,13 +1529,23 @@ else:
         if 'dest' in rs: rs['dest']='%s:443'%sni
     d['inbounds'].insert(d['inbounds'].index(uis[-1])+1, ib)
 
-# 严格 1:1：这个节点自己的 bridge client + 自己的 portal 标签
-for ib in d['inbounds']:
-    if ib.get('tag')=='reverse-in':
-        bs=ib['settings']['clients']
-        if any((b.get('reverse') or {}).get('tag')==ptag for b in bs):
-            raise SystemExit('DUPTAG')
-        bs.append({'id':buuid,'reverse':{'tag':ptag}})
+if kind=='wg':
+    # WireGuard：一个专属出站，VLESS 到落地机的隧道 IP（WG 已加密，这层不再加密）
+    obs=d.setdefault('outbounds',[])
+    if any(o.get('tag')==ptag for o in obs):
+        raise SystemExit('DUPTAG')
+    obs.append({'tag':ptag,'protocol':'vless',
+                'settings':{'address':os.environ['NEW_WGIP'],'port':int(os.environ['NEW_WGX']),
+                            'id':buuid,'encryption':'none'},
+                'streamSettings':{'network':'raw'}})
+else:
+    # 严格 1:1：这个节点自己的 bridge client + 自己的 portal 标签
+    for ib in d['inbounds']:
+        if ib.get('tag')=='reverse-in':
+            bs=ib['settings']['clients']
+            if any((b.get('reverse') or {}).get('tag')==ptag for b in bs):
+                raise SystemExit('DUPTAG')
+            bs.append({'id':buuid,'reverse':{'tag':ptag}})
 
 # 一节点一条路由，不往旧规则里追加
 d.setdefault('routing',{}).setdefault('rules',[]).append(
@@ -1234,11 +1565,24 @@ PY
   fi
 
   apply_cfg "$tmp"
-  open_fw "$REVERSE_PORT" 2>/dev/null || true
   [ "$uport" = "${USER_PORT:-443}" ] || open_fw "$uport" 2>/dev/null || true
-  ok "节点 $name 已添加（专属出口 portal-$name，入口端口 $uport，伪装域名 $nsni）"
-  warn "这个节点现在还没有出口机，隧道未建立前不可用"
-  print_b_cmd "$buuid" "$name"
+  if [ "$kind" = wg ]; then
+    # 节点进了 xray 配置之后再加 peer；顺带清掉加节点中途失败留下的残留 peer
+    local kp_priv; kp_priv=$(wg genkey)
+    # shellcheck disable=SC2046
+    WGP_PRIV="$kp_priv" WGP_PUB="$(printf '%s' "$kp_priv" | wg pubkey)" WGP_PSK="$(wg genpsk)" \
+      WGP_UUID="$buuid" WGP_XPORT="$wgx" wg_state put "$name" "$wgip" $(list_nodes 2>/dev/null)
+    wg_apply
+    ok "节点 $name 已添加（WireGuard 出口 wgx-$name，隧道 IP $wgip，入口端口 $uport，伪装域名 $nsni）"
+    warn "这个节点现在还没有落地机，WireGuard 握手前不可用"
+    warn "转发机云厂商安全组要放行 $(wg_state get port)/udp（WireGuard 端口，所有 WG 节点共用）"
+    print_wg_cmd "$name"
+  else
+    open_fw "$REVERSE_PORT" 2>/dev/null || true
+    ok "节点 $name 已添加（专属出口 portal-$name，入口端口 $uport，伪装域名 $nsni）"
+    warn "这个节点现在还没有出口机，隧道未建立前不可用"
+    print_b_cmd "$buuid" "$name"
+  fi
   echo
   info "出口机部署完后，跑菜单 8（自检）确认隧道已连"
   show_links
@@ -1299,7 +1643,10 @@ show_exit_cmd(){
   [ -n "$line" ] || die "节点 $name 不存在"
   local buuid; buuid=$(printf '%s' "$line" | cut -f3)
   [ -n "$buuid" ] || die "节点 $name 没有绑定出口机（配置异常，跑菜单 8 自检）"
-  print_b_cmd "$buuid" "$name"
+  case "$(printf '%s' "$line" | cut -f2)" in
+    wgx-*) print_wg_cmd "$name" ;;
+    *)     print_b_cmd "$buuid" "$name" ;;
+  esac
 }
 
 del_node(){
@@ -1365,7 +1712,7 @@ name=os.environ['DEL_NAME']
 ptags=set()
 for r in d.get('routing',{}).get('rules',[]):
     ot=r.get('outboundTag','')
-    if ot.startswith('portal') and name in r.get('user',[]) and 'probe-in' not in (r.get('inboundTag') or []):
+    if (ot.startswith('portal') or ot.startswith('wgx-')) and name in r.get('user',[]) and 'probe-in' not in (r.get('inboundTag') or []):
         ptags.add(ot)
 
 found=False
@@ -1392,7 +1739,7 @@ still={}
 for r in d.get('routing',{}).get('rules',[]):
     ot=r.get('outboundTag','')
     # 探测规则（probe-in）不算“共用”，否则 probe-<节点> 会让 bridge 永远删不掉
-    if ot.startswith('portal') and 'probe-in' not in (r.get('inboundTag') or []):
+    if (ot.startswith('portal') or ot.startswith('wgx-')) and 'probe-in' not in (r.get('inboundTag') or []):
         others=[u for u in r.get('user',[]) if u!=name]
         if others:
             still[ot]=others
@@ -1403,6 +1750,8 @@ if drop:
             ib['settings']['clients']=[
                 b for b in ib['settings']['clients']
                 if (b.get('reverse') or {}).get('tag') not in drop]
+    # WireGuard 节点：摘掉它的 wgx-<节点> 出站
+    d['outbounds']=[o for o in d.get('outbounds',[]) if o.get('tag') not in drop]
 
 # 同步摘掉 portal 路由里的这个用户，用空了的规则整条删掉
 rules=[]
@@ -1429,6 +1778,13 @@ PY
 
   # apply_cfg 会先 xray -test 校验，失败自动回滚
   apply_cfg "$tmp"
+  # WireGuard 节点：摘掉它的 peer（syncconf 热更新，不影响别的落地机）
+  case "$ptag" in wgx-*)
+    if [ -s "$WG_STATE" ]; then
+      wg_state del "$name"
+      if command -v wg >/dev/null; then wg_apply || warn "WireGuard peer 摘除失败，重跑一次 --del 或 --check"; fi
+    fi ;;
+  esac
   ok "节点 $name 及其出口绑定已删除（已备份原配置到 $CFG.bak-*）"
   echo
   info "剩下的节点："
@@ -1519,7 +1875,7 @@ for ib in ibs:
 n2p={}
 for r in rules:
     ot=r.get('outboundTag','')
-    if ot.startswith('portal') and not is_probe(r):
+    if (ot.startswith('portal') or ot.startswith('wgx-')) and not is_probe(r):
         for u in r.get('user',[]):
             n2p.setdefault(u,ot)
 pin=[ib for ib in ibs if ib.get('tag')=='probe-in']
@@ -1747,7 +2103,7 @@ def read_cfg():
     portal = {}
     for r in d.get('routing', {}).get('rules', []):
         ot = r.get('outboundTag', '')
-        if ot.startswith('portal') and 'probe-in' not in (r.get('inboundTag') or []):
+        if (ot.startswith('portal') or ot.startswith('wgx-')) and 'probe-in' not in (r.get('inboundTag') or []):
             for u in r.get('user', []):
                 portal[u] = ot
     use = {}
@@ -1758,6 +2114,7 @@ def read_cfg():
     for n, port, sni in nodes:
         ex = portal.get(n, '')
         out.append({'name': n, 'port': port, 'sni': sni, 'exit': ex,
+                    'kind': 'wg' if ex.startswith('wgx-') else 'reverse',
                     'shared': use.get(ex, 0) > 1,
                     'probe_user': 'probe-' + n,
                     'probe_pass': probe_acc.get('probe-' + n, '')})
@@ -1989,18 +2346,40 @@ def status_json():
             r = node_rec(n['name'])
             online = bool(r['probe_ok'] and t - r['probe_ts'] <= PROBE_EVERY + 2 * POLL + 60)
             out.append({'name': n['name'], 'port': n['port'], 'sni': n['sni'], 'exit': n['exit'],
-                        'shared': n['shared'], 'online': online, 'ip': r['ip'], 'ip_ts': r['ip_ts'],
+                        'kind': n['kind'], 'shared': n['shared'], 'online': online, 'ip': r['ip'], 'ip_ts': r['ip_ts'],
                         'probe_ts': r['probe_ts'], 'probe_err': r['probe_err'],
                         'up': r['up'], 'down': r['down'], 'total': r['up'] + r['down'],
                         'rate_up': r['rate_up'], 'rate_down': r['rate_down'],
                         'hist': [h[1] + h[2] for h in r['hist'][-40:]],
                         'src_user': r['cnt_user'], 'src_exit': r['cnt_exit'], 'since': r['since']})
         rp = a.get('REVERSE_PORT', '')
-        return {'now': t, 'version': VERSION, 'a_ip': a.get('A_IP', ''),
+        return {'now': t, 'version': VERSION, 'a_ip': a.get('A_IP', ''), 'wg': wg_info(),
                 'reverse_port': rp, 'tunnels': tunnel_count(int(rp)) if rp.isdigit() else 0,
                 'xray_active': state.get('xray_active', False), 'xray_since': state.get('xray_since', ''),
                 'last_poll': state['last_poll'], 'poll': POLL, 'probe_every': PROBE_EVERY,
                 'error': cfg_err or state['poll_err'], 'nodes': out, 'busy': mut_lock.locked(), 'manage': os.path.isfile(SCRIPT)}
+
+
+WG_STATE = os.environ.get('ATT_WG_STATE', '/etc/att-tunnel/wg.json')
+
+
+def wg_info():
+    """WireGuard 出口概况：UDP 端口 + 最近 180 秒内握手过的落地机数。没有 WG 节点返回 None。"""
+    try:
+        with open(WG_STATE) as f:
+            w = json.load(f)
+    except Exception:
+        return None
+    out = {'port': w.get('port'), 'peers': len(w.get('peers') or {}), 'up': 0}
+    try:
+        p = subprocess.run(['wg', 'show', 'attwg', 'latest-handshakes'], capture_output=True,
+                           text=True, timeout=5)
+        t = now()
+        out['up'] = sum(1 for l in p.stdout.split('\n') if len(l.split()) == 2
+                        and l.split()[1].isdigit() and 0 < t - int(l.split()[1]) < 180)
+    except Exception:
+        pass
+    return out
 
 
 def run_script(args, extra_env=None, timeout=180):
@@ -2069,7 +2448,7 @@ def node_link(name):
     """按需取分享链接 + 出口机命令 + 订阅 token。"""
     link = node_vless(name)
     rc, out = run_script(['--exit-cmd', name], timeout=30)
-    cmd = next((l.strip() for l in out.splitlines() if '--bridge ' in l), '')
+    cmd = next((l.strip() for l in out.splitlines() if '--bridge ' in l or '--wg-bridge ' in l), '')
     if rc != 0 or not cmd:
         raise RuntimeError(out or '取出口机命令失败')
     return {'name': name, 'link': link, 'exit_cmd': cmd, 'sub_token': sub_token(name)}
@@ -2119,19 +2498,19 @@ def split_exit_cmd(cmd):
     远程只执行我们在这里重新拼的固定形状命令。
     """
     m = re.search(r'(https?://\S+?/install\.sh)', cmd)
-    t = re.search(r'--bridge\s+([A-Za-z0-9+/=_-]+)', cmd)
+    t = re.search(r'--(wg-)?bridge\s+([A-Za-z0-9+/=_-]+)', cmd)
     if not m or not t:
         raise RuntimeError('解析出口机命令失败')
-    url, token = m.group(1), t.group(1)
+    url, token = m.group(1), t.group(2)
     if not BRIDGE_URL_RE.match(url) or not BRIDGE_TOKEN_RE.match(token):
         raise RuntimeError('出口机命令里的地址或 token 不合规')
-    return url, token
+    return url, token, ('--wg-bridge' if t.group(1) else '--bridge')
 def ssh_install_bridge(host, port, user, password, key_text, exit_cmd, log_cb=None):
     """到出口机上跑 att-tunnel --bridge <token>。返回 (rc, 输出)。
 
     凭据只落临时文件（0600，用完删），不进命令行（ps 里看不到）、不写日志。
     """
-    url, token = split_exit_cmd(exit_cmd)
+    url, token, flag = split_exit_cmd(exit_cmd)
     sshbin = have('ssh')
     if not sshbin:
         return 127, '本机没有 ssh 客户端（装一下 openssh-client）'
@@ -2139,9 +2518,9 @@ def ssh_install_bridge(host, port, user, password, key_text, exit_cmd, log_cb=No
     # 远程只执行这一条固定形状的命令，url / token 已校验并再做一次 shell 转义
     remote = ('set -e; export DEBIAN_FRONTEND=noninteractive; '
               'cd /tmp; curl -fsSL %s -o att-bridge.sh; '
-              'ATT_NONINTERACTIVE=1 ATT_RAW_URL=%s bash att-bridge.sh --bridge %s; '
+              'ATT_NONINTERACTIVE=1 ATT_RAW_URL=%s bash att-bridge.sh %s %s; '
               'rm -f att-bridge.sh'
-              % (shlex.quote(url), shlex.quote(url), shlex.quote(token)))
+              % (shlex.quote(url), shlex.quote(url), flag, shlex.quote(token)))
 
     tmpdir = tempfile.mkdtemp(prefix='att-ssh-')
     env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
@@ -2344,6 +2723,8 @@ pre.out{max-height:220px;overflow:auto;background:var(--bg);padding:10px;border-
 PAGE_MAIN += '''
 <dialog id="dAdd" aria-labelledby="dAddH"><form id="fAdd" method="dialog"><div class="dh" id="dAddH">添加节点</div><div class="db">
 <label for="aName">节点名称（字母/数字/下划线/连字符，最多 32 位）</label><input id="aName" name="name" required maxlength="32" pattern="[A-Za-z0-9_-]{1,32}" placeholder="如 LA2" autocomplete="off">
+<label for="aKind">落地机接入方式</label><select id="aKind" name="kind"><option value="reverse">VLESS 反向（默认，一条 TCP 长连接）</option><option value="wg">WireGuard（UDP，每条连接各走各的）</option></select>
+<p class="mut" id="aKindH" style="font-size:13px;margin:4px 0 0">落地机主动拨入转发机的反代口（TCP），落地机零入站。</p>
 <label for="aPort">入口端口（留空 = 与主入口共用 <span id="defPort"></span>）</label><input id="aPort" name="port" inputmode="numeric" pattern="[0-9]{1,5}" placeholder="留空即可">
 <label for="aSni">伪装域名（只在单独端口时生效；共用端口时沿用主入口的 <span id="defSni"></span>）</label><select id="aSni" name="sni"></select>
 <div id="aCustW" hidden><label for="aCust">自定义域名（需支持 TLS 1.3）</label><input id="aCust" placeholder="www.example.com" autocomplete="off"></div>
@@ -2385,7 +2766,7 @@ PAGE_MAIN += '''
 function render(d){D=d;busy=d.busy;
 $("ver").textContent="v"+d.version;
 const xs=d.xray_active?'<span class="pill on">xray 运行中</span>':'<span class="pill off">xray 未运行</span>';
-$("hinfo").innerHTML=`<span>A 机 <b class="mono">${esc(d.a_ip)}</b></span><span>反代口 ${esc(d.reverse_port)}</span><span>隧道连接 ${d.tunnels}</span>${xs}`;
+$("hinfo").innerHTML=`<span>A 机 <b class="mono">${esc(d.a_ip)}</b></span><span>反代口 ${esc(d.reverse_port)}</span><span>隧道连接 ${d.tunnels}</span>${d.wg?`<span>WireGuard UDP ${esc(d.wg.port)} · 握手 ${d.wg.up} / ${d.wg.peers}</span>`:""}${xs}`;
 const e=$("err");if(d.error){e.style.display="block";e.textContent="⚠ 统计异常："+d.error}else e.style.display="none";
 const on=d.nodes.filter(n=>n.online).length,up=d.nodes.reduce((a,n)=>a+n.up,0),dn=d.nodes.reduce((a,n)=>a+n.down,0);
 $("sum").innerHTML=[["节点",d.nodes.length],["在线",on+" / "+d.nodes.length],["总上传",fb(up)],["总下载",fb(dn)],["总流量",fb(up+dn)]].map(x=>`<div class="card"><span class="mut">${x[0]}</span><b>${x[1]}</b></div>`).join("");
@@ -2395,7 +2776,7 @@ const mx=Math.max(1,...d.nodes.map(n=>n.total));
 $("list").innerHTML=d.nodes.map(n=>{const st=n.online?'<span class="pill on">在线</span>':(n.probe_ts?'<span class="pill off">离线</span>':'<span class="pill w">待探测</span>');
 return`<section class="card node"><h2><span>${esc(n.name)}</span>${st}</h2><dl class="kv">
 <dt>出口 IP</dt><dd class="mono">${esc(n.ip||"—")}</dd><dt>最后探测</dt><dd>${ago(n.probe_ts)}${n.ip_ts&&!n.online?" · 上次在线 "+ago(n.ip_ts):""}</dd>
-<dt>入口</dt><dd>${esc(n.port)} · ${esc(n.sni)}</dd><dt>出口绑定</dt><dd>${esc(n.exit||"未绑定")}${n.shared?" ⚠ 共用":""}</dd></dl>
+<dt>入口</dt><dd>${esc(n.port)} · ${esc(n.sni)}</dd><dt>出口绑定</dt><dd>${esc(n.exit||"未绑定")}${n.exit?(n.kind=="wg"?" · WireGuard":" · VLESS 反向"):""}${n.shared?" ⚠ 共用":""}</dd></dl>
 ${(!n.online&&n.probe_err)?`<div class="err" style="font-size:13px">${esc(n.probe_err)}</div>`:""}
 <div class="tr"><div><small>↑ 上传</small><b>${fb(n.up)}</b><small>${fb(n.rate_up)}/s</small></div><div><small>↓ 下载</small><b>${fb(n.down)}</b><small>${fb(n.rate_down)}/s</small></div></div>
 <div class="barw" title="占全部节点最大值的比例"><div class="bar" style="width:${(n.total/mx*100).toFixed(1)}%"></div></div>
@@ -2459,7 +2840,9 @@ finally{$("delGo").textContent="删除";load()}};
 $("aSni").innerHTML='<option value="">沿用主入口</option>'+SNIS.map(s=>`<option value="${esc(s[0])}">${esc(s[0])}（${esc(s[1])}）</option>`).join("")+'<option value="__c">自定义…</option>';
 $("aSni").onchange=()=>{$("aCustW").hidden=$("aSni").value!="__c"};
 $("aSshHost").oninput=()=>{$("aSshW").hidden=!$("aSshHost").value.trim()};
-$("bAdd").onclick=()=>{const m=D&&D.nodes[0];$("defPort").textContent=m?m.port:"";$("defSni").textContent=m?m.sni:"";$("fAdd").reset();$("aCustW").hidden=true;$("aSshW").hidden=true;$("aSshUser").value="root";$("aSshPort").value="22";$("dAdd").showModal();$("aName").focus()};
+const KH={reverse:"落地机主动拨入转发机的反代口（TCP），落地机零入站。",wg:"落地机用 WireGuard 主动拨入转发机（UDP，落地机零入站）。转发机安全组要放行 WireGuard 的 UDP 端口（首个 WG 节点建好后显示在顶部）。"};
+$("aKind").onchange=()=>{$("aKindH").textContent=KH[$("aKind").value]||""};
+$("bAdd").onclick=()=>{const m=D&&D.nodes[0];$("defPort").textContent=m?m.port:"";$("defSni").textContent=m?m.sni:"";$("fAdd").reset();$("aKindH").textContent=KH.reverse;$("aCustW").hidden=true;$("aSshW").hidden=true;$("aSshUser").value="root";$("aSshPort").value="22";$("dAdd").showModal();$("aName").focus()};
 $("fAdd").onsubmit=async ev=>{ev.preventDefault();const name=$("aName").value.trim(),port=$("aPort").value.trim();let sni=$("aSni").value;if(sni=="__c")sni=$("aCust").value.trim();
 if(!/^[A-Za-z0-9_-]{1,32}$/.test(name)){toast("节点名只能用字母/数字/下划线/连字符，最多 32 位","bad");return}
 if(port&&!(/^[0-9]+$/.test(port)&&+port>=1&&+port<=65535)){toast("端口必须是 1-65535","bad");return}
@@ -2473,7 +2856,8 @@ if(sshHost){
   if(!sshPass&&!sshKey){toast("填了 SSH 主机就要给密码或私钥","bad");return}
 }
 $("aGo").disabled=true;$("aGo").textContent="添加中…（约 10 秒）";
-try{const j=await post("/api/add",{name,port,sni,ssh_host:sshHost,ssh_user:sshUser,
+const kind=$("aKind").value;
+try{const j=await post("/api/add",{name,port,sni,kind,ssh_host:sshHost,ssh_user:sshUser,
   ssh_port:sshPort,ssh_pass:sshPass,ssh_key:sshKey});
 $("dAdd").close();toast("节点 "+name+" 已添加","ok");
 $("aSshPass").value="";$("aSshKey").value="";
@@ -2662,6 +3046,9 @@ class H(http.server.BaseHTTPRequestHandler):
 
     def do_add(self, f):
         name, port, sni = f.get('name', '').strip(), f.get('port', '').strip(), f.get('sni', '').strip()
+        kind = f.get('kind', '').strip() or 'reverse'
+        if kind not in ('reverse', 'wg'):
+            return self.jsend(400, {'error': '出口方式只能是 VLESS 反向或 WireGuard'})
         if not NAME_RE.match(name):
             return self.jsend(400, {'error': '节点名只能用字母/数字/下划线/连字符，最多 32 位'})
         if port and not (port.isdigit() and 1 <= int(port) <= 65535):
@@ -2692,7 +3079,7 @@ class H(http.server.BaseHTTPRequestHandler):
         if not mut_lock.acquire(blocking=False):
             return self.jsend(409, {'error': '另一个加/删操作正在进行，请稍后'})
         try:
-            env = {'ATT_NODE_PORT': port, 'ATT_NODE_SNI': sni}
+            env = {'ATT_NODE_PORT': port, 'ATT_NODE_SNI': sni, 'ATT_NODE_KIND': kind}
             rc, out = run_script(['--add', name], env, timeout=240)
             after_change(name)
         finally:
@@ -2948,6 +3335,23 @@ selfcheck(){
         warn "部分请求会挂死，等 ~20s 内核回收；若长期如此查：sysctl net.ipv4.tcp_retries2（应为 5）"
       fi
     fi
+    if [ -s "$WG_STATE" ]; then
+      echo
+      if ip link show "$WG_IF" >/dev/null 2>&1; then
+        ok "WireGuard 接口 $WG_IF 运行中（UDP $(wg_state get port)）"
+        local t0 pk hs; t0=$(date +%s)
+        while read -r pk hs; do
+          [ -z "$pk" ] && continue
+          if [ "${hs:-0}" -gt 0 ] && [ $((t0-hs)) -lt 180 ]; then
+            echo "    peer ${pk:0:10}…  最近握手 $((t0-hs)) 秒前"
+          else
+            echo "    peer ${pk:0:10}…  ${YEL}没有握手（落地机未部署 / UDP 端口没放行）${RST}"
+          fi
+        done < <(wg show "$WG_IF" latest-handshakes 2>/dev/null)
+      else
+        echo "${RED}[X]${RST} 有 WireGuard 节点，但接口 $WG_IF 没起来：systemctl restart wg-quick@$WG_IF"
+      fi
+    fi
     local r2; r2=$(sysctl -n net.ipv4.tcp_retries2 2>/dev/null)
     [ "$r2" = 5 ] && ok "tcp_retries2=5（僵死隧道快速回收）" || warn "tcp_retries2=$r2，建议为 5"
     check_bbr
@@ -2956,15 +3360,29 @@ selfcheck(){
     info "如果两个节点查出同一个出口 IP，说明它们共用了出口，不是 1:1"
   elif [ -f "$STATE/b.env" ]; then
     source "$STATE/b.env"
+    if [ "${KIND:-}" = wg ]; then
+      echo "角色: ${BLD}B（出口端，WireGuard）${RST}   拨向: $A_IP:$WG_PORT/udp   隧道 IP: $TUN_IP"
+      local hs t0; t0=$(date +%s); hs=$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk '{print $2}' | sed -n 1p) || hs=0
+      if [ "${hs:-0}" -gt 0 ] 2>/dev/null && [ $((t0-hs)) -lt 180 ]; then
+        ok "WireGuard 最近握手 $((t0-hs)) 秒前"
+      else
+        echo "${RED}[X]${RST} WireGuard 没有握手，检查 A 侧安全组是否放行 $WG_PORT/udp"
+      fi
+    else
     echo "角色: ${BLD}B（出口端）${RST}   拨向: $A_IP:$REVERSE_PORT"
     if ss -tn state established 2>/dev/null | grep -q "$A_IP:$REVERSE_PORT"; then
       ok "隧道 ESTAB 正常"
     else
       echo "${RED}[X]${RST} 隧道未建立，检查 A 侧防火墙/安全组 $REVERSE_PORT/tcp"
     fi
+    fi
     local listen; listen=$(ss -ltn 2>/dev/null | grep -vE '127.0.0.1|::1|State' | wc -l)
     ok "对外监听端口数（含 SSH）: $listen"
-    grep -q '"inbounds": \[\]' "$CFG" && ok "B 无任何用户入站（零暴露）" || warn "B 端出现了 inbound，与设计不符"
+    if [ "${KIND:-}" = wg ]; then
+      ok "B 的 Xray 只听隧道 IP ${TUN_IP:-?}（公网零暴露）"
+    else
+      grep -q '"inbounds": \[\]' "$CFG" && ok "B 无任何用户入站（零暴露）" || warn "B 端出现了 inbound，与设计不符"
+    fi
     check_bbr
     echo -n "本机实时公网 IP: "; pubip; echo
   else
@@ -3014,12 +3432,20 @@ uninstall(){
   systemctl stop "$SVC" 2>/dev/null || true
   systemctl disable "$SVC" 2>/dev/null || true
   rm -f "/etc/systemd/system/$SVC.service"
+  rm -rf "/etc/systemd/system/$SVC.service.d"
+  # 只停 att-tunnel 自己生成的 attwg，别的 WireGuard 不碰
+  if [ -f "$WG_CONF" ] && grep -q '^# att-tunnel' "$WG_CONF" 2>/dev/null; then
+    systemctl disable --now "wg-quick@$WG_IF" 2>/dev/null || true
+  fi
   systemctl daemon-reload 2>/dev/null || true
   local bdir="/root/att-tunnel-backup-$(date +%Y%m%d%H%M%S)"
   mkdir -p "$bdir"
   [ -f "$CFG" ] && cp "$CFG" "$bdir/" 2>/dev/null || true
   [ -d "$STATE" ] && cp -r "$STATE" "$bdir/" 2>/dev/null || true
   [ -d "$WEB_DATA" ] && cp -r "$WEB_DATA" "$bdir/" 2>/dev/null || true
+  if [ -f "$WG_CONF" ] && grep -q '^# att-tunnel' "$WG_CONF" 2>/dev/null; then
+    cp "$WG_CONF" "$bdir/" 2>/dev/null || true; rm -f "$WG_CONF"
+  fi
   rm -rf "$STATE" "$CFG_DIR" "$WEB_DIR" "$WEB_DATA"
   ok "已停止并清理 att-tunnel。备份在：$bdir"
   ok "你机器上原有的 xray / 3x-ui / NodeLite 未受影响"
@@ -3037,7 +3463,7 @@ menu(){
     echo "  2) 部署服务器 B（AT&T 出口机，需 A 的 token）"
     echo "  3) 看节点分享链接"
     echo "  4) 节点 / 出口机 对应表"
-    echo "  5) 加一个节点（同时生成它专属出口机的部署命令）"
+    echo "  5) 加一个节点（选 VLESS 反向或 WireGuard，生成它专属出口机的部署命令）"
     echo "  6) 重新拿某节点的出口机部署命令"
     echo "  7) 删除一个节点（连带它的出口绑定）"
     echo "  8) 运行自检"
@@ -3076,6 +3502,7 @@ RAW_URL="${ATT_RAW_URL:-https://raw.githubusercontent.com/dabao9037/att-tunnel/m
 
 case "${1:-}" in
   --bridge)   need_root; deploy_b "${2:-}" ;;
+  --wg-bridge) need_root; deploy_wg_b "${2:-}" ;;
   --server-a) deploy_a ;;
   --check)    selfcheck ;;
   --tune)     tune_only ;;
@@ -3092,5 +3519,5 @@ case "${1:-}" in
   --web-info) web_info ;;
   --version)  echo "att-tunnel v$VERSION" ;;
   "")         menu ;;
-  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --check | --tune | --links | --list | --add NAME | --del NAME | --exit-cmd NAME | --link NAME | --migrate | --enable-stats | --web | --web-off | --web-info）" ;;
+  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --wg-bridge TOKEN | --check | --tune | --links | --list | --add NAME | --del NAME | --exit-cmd NAME | --link NAME | --migrate | --enable-stats | --web | --web-off | --web-info）" ;;
 esac
