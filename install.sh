@@ -2973,6 +2973,8 @@ class H(http.server.BaseHTTPRequestHandler):
         if r is None:
             return self.send(404, 'Not Found', 'text/plain')
         ip = self.client_address[0]
+        if r == '/__upgrade__':
+            return self.do_upgrade()
         if r == '/login':
             if rate_limited(ip):
                 return self.login_page(429, '失败次数过多，请 10 分钟后再试')
@@ -3105,6 +3107,35 @@ class H(http.server.BaseHTTPRequestHandler):
         elif sh:
             res['ssh_error'] = '取不到出口机命令，没法 SSH 安装，请用下面的命令手动装'
         return self.jsend(200, res)
+
+    def do_upgrade(self):
+        """响应 hub 的升级请求：重新下载并运行安装脚本的 --upgrade。
+        这个路由不需要登录，hub 的请求直接到这里。
+        """
+        if not os.path.isfile(SCRIPT):
+            return self.send(501, '面板未开启节点管理，无法升级', 'text/plain')
+        # 读取安装时保存的源 URL（bash <(curl ...) 运行时脚本会保存这个）
+        aenv = load_env(AENV)
+        raw = aenv.get('ATT_RAW_URL', '')
+        if not raw or not raw.startswith('http'):
+            return self.send(500, '找不到脚本来源 URL，无法自动升级', 'text/plain')
+        
+        log('收到升级请求，准备从 %s 重新下载并升级' % raw)
+        
+        # 后台执行升级（下载 + bash script.sh --upgrade），不卡住这个请求
+        def upgrade_task():
+            try:
+                cmd = 'curl -fsSL %s | bash -s -- --upgrade' % shlex.quote(raw)
+                log('执行升级命令：%s' % cmd)
+                subprocess.run(cmd, shell=True, timeout=300,
+                              env=dict(os.environ, ATT_YES='1'),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                log('升级完成')
+            except Exception as e:
+                log('升级失败：%s' % e)
+        
+        threading.Thread(target=upgrade_task, daemon=True).start()
+        return self.send(200, '升级已开始，约 1-2 分钟后生效', 'text/plain')
 
 
 class Srv(http.server.ThreadingHTTPServer):
