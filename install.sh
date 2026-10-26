@@ -162,14 +162,14 @@ CANDIDATES_WITH_COUNTRY=(
   "www.atlasobscura.com|美国"
   "www.backblaze.com|美国"
   "www.gog.com|波兰"
-  "www.cern.ch|瑞士"
+  "www.fraunhofer.de|德国"
   "www.sciencemuseum.org.uk|英国"
   "www.visitsingapore.com|新加坡"
   "www.discoverhongkong.com|中国香港"
   "www.a-star.edu.sg|新加坡"
-  "www.animatetimes.com|日本"
+  "www.4gamer.net|日本"
   "www.famitsu.com|日本"
-  "www.jodrellbank.net|英国"
+  "www.skao.int|英国"
 )
 
 # 提取纯域名列表（向后兼容）
