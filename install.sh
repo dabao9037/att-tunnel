@@ -2528,7 +2528,22 @@ def ssh_install_bridge(host, port, user, password, key_text, exit_cmd, log_cb=No
 export DEBIAN_FRONTEND=noninteractive
 trap 'rm -f /tmp/att-bridge.sh' EXIT
 cd /tmp
-curl -fsSL {url} -o att-bridge.sh
+if command -v curl >/dev/null 2>&1 && curl -fsSL --max-time 60 {url} -o /tmp/att-bridge.sh; then
+  :
+elif command -v wget >/dev/null 2>&1 && wget -q -O /tmp/att-bridge.sh {url}; then
+  :
+elif command -v python3 >/dev/null 2>&1 && python3 -c 'import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' {url} /tmp/att-bridge.sh; then
+  :
+elif [ "$(id -u)" -eq 0 ] && command -v apt-get >/dev/null 2>&1 && apt-get update -qq && apt-get install -y -qq curl >/dev/null && curl -fsSL --max-time 60 {url} -o /tmp/att-bridge.sh; then
+  :
+elif [ "$(id -u)" -eq 0 ] && command -v dnf >/dev/null 2>&1 && dnf install -y -q curl >/dev/null && curl -fsSL --max-time 60 {url} -o /tmp/att-bridge.sh; then
+  :
+elif [ "$(id -u)" -eq 0 ] && command -v yum >/dev/null 2>&1 && yum install -y -q curl >/dev/null && curl -fsSL --max-time 60 {url} -o /tmp/att-bridge.sh; then
+  :
+else
+  echo "[X] 出口机上没有可用的下载工具（curl/wget/python3），自动安装 curl 也失败；请先安装 curl，或用一键代码手动安装。" >&2
+  exit 127
+fi
 if [ "$(id -u)" -eq 0 ]; then
   ATT_NONINTERACTIVE=1 ATT_RAW_URL={url} bash /tmp/att-bridge.sh {flag} {token}
 else
