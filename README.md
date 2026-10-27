@@ -232,9 +232,7 @@ bash install.sh --del node2   # 非交互指定
 
 这些都是实测踩出来的，不是照抄文档：
 
-1. **`www.microsoft.com` 作 REALITY 回落域名会握手失败**（Xray 26.3.27 实测：AuthKey 双方匹配，但 TLS 在 Certificate 阶段中断）。现在预置列表与 NodeLite 保持一致，并在部署时**实测挑选**。
-
-   顺便对 NodeLite 的 12 个预置域名逐个做了真实 REALITY 握手测试，**11 个通过，`www.hkstp.org` 不通**（它 TLS 1.3 正常，但 REALITY 握手失败），故本脚本不纳入。
+1. **`www.microsoft.com` 作 REALITY 回落域名会握手失败**（Xray 26.3.27 实测：AuthKey 双方匹配，但 TLS 在 Certificate 阶段中断）。现在预置列表与 NodeLite 的 `config/reality-targets.json` 完全同步（14 个），部署时逐个实测 TLS 1.3，不可用的自动跳过。2026-10-27 复测新增的 `www.hkstp.org`、`www.visitdubai.com`、`www.dm.gov.ae` 均通过 TLS 1.3、HTTP/2 和证书匹配。
 
 2. **A 侧不能手写 `portal` 出站**。reverse 组件会自己注册 handler，手写会报 `"vnext" should have one and only one member`。
 

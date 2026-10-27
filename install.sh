@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.5.1"
+VERSION="2.5.2"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -154,22 +154,25 @@ install_xray(){
 }
 
 # ---------- 回落域名：实测可用才用（文档坑：microsoft 在新版会握手失败） ----------
-# 与 NodeLite 保持一致的预置列表（NodeLite 默认 www.atlasobscura.com）。
-# 已逐个做过真实 REALITY 握手实测（Xray 26.3.27），
-# NodeLite 预置中的 www.hkstp.org 实测不通，故不纳入。
-# 伪装域名列表：域名 | 国家
+# 与 NodeLite 的 config/reality-targets.json 保持完全同步（2026-10-27：14 个）。
+# 2026-10-27 复测新增的 hkstp / visitdubai / dm.gov.ae 均通过 TLS 1.3、HTTP/2、
+# 证书匹配；部署时仍会逐个实测，不通的自动跳过。
+# 伪装域名列表：域名 | 国家/地区
 CANDIDATES_WITH_COUNTRY=(
   "www.atlasobscura.com|美国"
   "www.backblaze.com|美国"
-  "www.gog.com|波兰"
-  "www.fraunhofer.de|德国"
+  "www.skao.int|英国"
   "www.sciencemuseum.org.uk|英国"
-  "www.visitsingapore.com|新加坡"
-  "www.discoverhongkong.com|中国香港"
-  "www.a-star.edu.sg|新加坡"
   "www.4gamer.net|日本"
   "www.famitsu.com|日本"
-  "www.skao.int|英国"
+  "www.a-star.edu.sg|新加坡"
+  "www.visitsingapore.com|新加坡"
+  "www.fraunhofer.de|德国"
+  "www.gog.com|波兰"
+  "www.hkstp.org|中国香港"
+  "www.discoverhongkong.com|中国香港"
+  "www.visitdubai.com|阿联酋"
+  "www.dm.gov.ae|阿联酋"
 )
 
 # 提取纯域名列表（向后兼容）
