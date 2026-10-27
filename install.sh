@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.5.0"
+VERSION="2.5.1"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -2515,12 +2515,36 @@ def ssh_install_bridge(host, port, user, password, key_text, exit_cmd, log_cb=No
     if not sshbin:
         return 127, '本机没有 ssh 客户端（装一下 openssh-client）'
 
-    # 远程只执行这一条固定形状的命令，url / token 已校验并再做一次 shell 转义
-    remote = ('set -e; export DEBIAN_FRONTEND=noninteractive; '
-              'cd /tmp; curl -fsSL %s -o att-bridge.sh; '
-              'ATT_NONINTERACTIVE=1 ATT_RAW_URL=%s bash att-bridge.sh %s %s; '
-              'rm -f att-bridge.sh'
-              % (shlex.quote(url), shlex.quote(url), flag, shlex.quote(token)))
+    # 远程只执行这一条固定形状的命令，url / token 已校验并再做一次 shell 转义。
+    # 非 root 用户不能直接跑 --bridge（脚本会 need_root），所以这里用 sudo 提权：
+    #   1) 能免密 sudo 就直接 sudo -n；
+    #   2) 有 SSH 密码就用同一个密码走 sudo -S（面板只有一个密码框）；
+    #   3) 只给私钥且没有免密 sudo 时，明确报错，不静默失败。
+    # 密码只写进远端脚本的标准输入，不作为 sudo 参数，也不落远端文件。
+    remote = r'''set -e
+export DEBIAN_FRONTEND=noninteractive
+trap 'rm -f /tmp/att-bridge.sh' EXIT
+cd /tmp
+curl -fsSL {url} -o att-bridge.sh
+if [ "$(id -u)" -eq 0 ]; then
+  ATT_NONINTERACTIVE=1 ATT_RAW_URL={url} bash /tmp/att-bridge.sh {flag} {token}
+else
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "[X] SSH 用户不是 root，且机器上没有 sudo；请改用 root 登录，或用一键代码手动安装。" >&2
+    exit 126
+  fi
+  SUDO_PASS={sudo_pass}
+  if sudo -n true 2>/dev/null; then
+    sudo -n env DEBIAN_FRONTEND=noninteractive ATT_NONINTERACTIVE=1 ATT_RAW_URL={url} bash /tmp/att-bridge.sh {flag} {token}
+  elif [ -n "$SUDO_PASS" ] && printf '%s\n' "$SUDO_PASS" | sudo -S -p '' true 2>/dev/null; then
+    printf '%s\n' "$SUDO_PASS" | sudo -S -p '' env DEBIAN_FRONTEND=noninteractive ATT_NONINTERACTIVE=1 ATT_RAW_URL={url} bash /tmp/att-bridge.sh {flag} {token}
+  else
+    echo "[X] SSH 用户不是 root，且 sudo 不可用或密码不正确。请给该用户配置免密 sudo，或改用 root 登录。" >&2
+    exit 126
+  fi
+fi
+'''.format(url=shlex.quote(url), flag=flag, token=shlex.quote(token),
+           sudo_pass=shlex.quote(password or ''))
 
     tmpdir = tempfile.mkdtemp(prefix='att-ssh-')
     env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
@@ -2733,7 +2757,8 @@ PAGE_MAIN += '''
 填了就直接 SSH 上去装；不填就只生成一键代码，你自己去跑。凭据只用于本次安装，面板不保存。</p>
 <label for="aSshHost">出口机 IP / 域名（留空 = 只生成一键代码）</label><input id="aSshHost" placeholder="如 1.2.3.4" autocomplete="off">
 <div id="aSshW" hidden>
-<div style="display:flex;gap:8px"><div style="flex:2"><label for="aSshUser">用户名</label><input id="aSshUser" value="root" autocomplete="off"></div>
+<p class="mut" style="font-size:12px;margin:0 0 6px">非 root 用户需要 sudo 权限：填了密码会用同一密码提权；只填私钥时，要求该用户已配置免密 sudo。</p>
+<div style="display:flex;gap:8px"><div style="flex:2"><label for="aSshUser">用户名（非 root 需 sudo）</label><input id="aSshUser" value="root" autocomplete="off"></div>
 <div style="flex:1"><label for="aSshPort">SSH 端口</label><input id="aSshPort" value="22" inputmode="numeric" pattern="[0-9]{1,5}"></div></div>
 <label for="aSshPass">密码（有私钥就不用填）</label><input id="aSshPass" type="password" autocomplete="new-password">
 <label for="aSshKey">或贴私钥（与密码二选一，优先用私钥）</label>
