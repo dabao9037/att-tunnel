@@ -152,9 +152,9 @@ bash install.sh --add node2      # 非交互指定名称
 加节点时选（菜单 5 会问；非交互用 `ATT_NODE_KIND=reverse|wg`；网页面板「添加节点」里有下拉框）：
 
 - **VLESS 反向**（默认）：落地机经一条 TCP 长连接拨入 A 的反代口，打印 `--bridge <TOKEN>`。
-- **WireGuard**：落地机用 WireGuard 主动拨 A 的 UDP 口（PersistentKeepalive 15s），落地机照样零公网入站；A 的 Xray 把该节点流量经 WG 隧道送到落地机上只听隧道 IP 的 VLESS 入站，再从落地机出网。打印 `--wg-bridge <TOKEN>`。每个用户连接各走一条 TCP（跑在 UDP 里），线路丢包时不会一条拖慢全部。
+- **WireGuard**：落地机用 WireGuard 主动拨 A 的 UDP 口（默认 PersistentKeepalive 15s），落地机照样零公网入站；A 的 Xray 把该节点流量经 WG 隧道送到落地机上只听隧道 IP 的 VLESS 入站，再从落地机出网。打印 `--wg-bridge <TOKEN>`。每个用户连接各走一条 TCP（跑在 UDP 里），线路丢包时不会一条拖慢全部。
 
-WireGuard 细节：A 端第一次加 WG 节点时创建接口 `attwg`（随机 UDP 端口，隧道网段 `10.77.0.0/24`，可用 `ATT_WG_PORT` / `ATT_WG_NET` 指定），状态在 `/etc/att-tunnel/wg.json`，`/etc/wireguard/attwg.conf` 由它生成；每个 WG 节点一个 peer、一个 /32 隧道 IP，严格 1:1。加/删 WG 节点用 `wg syncconf` 热更新，不断其它落地机。**A 的云安全组要放行这个 UDP 端口**（所有 WG 节点共用，面板顶部会显示）。需要内核支持 WireGuard（5.6+ 自带；OpenVZ/LXC 一般不行，这种机器请用 VLESS 反向）。分享链接、订阅、出口探测、流量统计、SSH 直装和反向节点完全一样。
+WireGuard 细节：A 端第一次加 WG 节点时创建接口 `attwg`（随机 UDP 端口，隧道网段 `10.77.0.0/24`，可用 `ATT_WG_PORT` / `ATT_WG_NET` 指定），状态在 `/etc/att-tunnel/wg.json`，`/etc/wireguard/attwg.conf` 由它生成；每个 WG 节点一个 peer、一个 /32 隧道 IP，严格 1:1。加/删 WG 节点用 `wg syncconf` 热更新，不断其它落地机。**A 的云安全组要放行这个 UDP 端口**（所有 WG 节点共用，面板顶部会显示）。WG 默认 MTU 1380，可用 `ATT_WG_MTU`（1280-1420）覆盖；落地机 keepalive 可用 `ATT_WG_KEEPALIVE`（5-60 秒）覆盖，命令里的 token 会带上这两个值，旧 token 缺字段时自动用默认值。B 的 Xray 通过 systemd `BindsTo` 绑定 `wg-quick@attwg`，WG 接口重启时 Xray 会跟着重启；A 的 Xray 在有 WG 节点时也会等 `attwg` 启动。需要内核支持 WireGuard（5.6+ 自带；OpenVZ/LXC 一般不行，这种机器请用 VLESS 反向）。分享链接、订阅、出口探测、流量统计、SSH 直装和反向节点完全一样。
 
 ### 看对应关系 / 重新拿出口机命令
 

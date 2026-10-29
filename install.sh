@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.5.2"
+VERSION="2.5.3"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -260,10 +260,14 @@ pubip(){
 
 # 建立独立 systemd 服务（不动官方 xray.service）
 write_unit(){
+  local wg_after=""
+  if [ -s "$WG_STATE" ] || grep -q 'wgx-' "$CFG" 2>/dev/null; then
+    wg_after=$'\nAfter=wg-quick@attwg.service\nWants=wg-quick@attwg.service'
+  fi
   cat > "/etc/systemd/system/$SVC.service" <<EOF
 [Unit]
 Description=att-tunnel (Xray VLESS Reverse)
-After=network-online.target
+After=network-online.target$wg_after
 Wants=network-online.target
 
 [Service]
@@ -334,6 +338,13 @@ tune_tcp(){
       echo "net.core.default_qdisc = fq"
       echo "net.ipv4.tcp_congestion_control = bbr"
     fi
+    echo "net.ipv4.tcp_slow_start_after_idle = 0"
+    echo "net.ipv4.tcp_mtu_probing = 1"
+    echo "net.core.rmem_max = 16777216"
+    echo "net.core.wmem_max = 16777216"
+    echo "net.ipv4.tcp_rmem = 4096 87380 16777216"
+    echo "net.ipv4.tcp_wmem = 4096 65536 16777216"
+    echo "net.core.netdev_max_backlog = 16384"
   } > "$f"
   # 开机自动加载 bbr 模块（编进内核的不需要，写了也无害）
   [ "$bbr" = 1 ] && [ -d /etc/modules-load.d ] && echo tcp_bbr > /etc/modules-load.d/att-tunnel-bbr.conf
@@ -350,6 +361,11 @@ tune_tcp(){
   else
     warn "内核不支持 BBR（$(uname -r)），沿用 $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   fi
+  for kv in net.ipv4.tcp_slow_start_after_idle=0 net.ipv4.tcp_mtu_probing=1 \
+            net.core.rmem_max=16777216 net.core.wmem_max=16777216 \
+            net.core.netdev_max_backlog=16384; do
+    sysctl -w "$kv" >/dev/null 2>&1 || true
+  done
 }
 
 # 老机器单独补调优（不重装、不动配置和节点）：--tune
@@ -463,7 +479,8 @@ def save(d):
     with os.fdopen(fd,'w') as h: json.dump(d,h,indent=1)
     os.replace(tmp,f)
 if act=='init':
-    save({'port':int(a[1]),'net':a[2],'priv':E('WG_PRIV'),'pub':E('WG_PUB'),'peers':{}})
+    save({'port':int(a[1]),'net':a[2],'mtu':int(a[3]) if len(a)>3 else 1380,
+          'priv':E('WG_PRIV'),'pub':E('WG_PUB'),'peers':{}})
 elif act=='alloc':
     # 给 NAME 挑隧道 IP；不在保留列表里的残留 peer（加节点中途失败留下的）不占位
     d=load(); name=a[1]; keep=set(a[2:])
@@ -484,13 +501,17 @@ elif act=='del':
     d=load(); d['peers'].pop(a[1],None); save(d)
 elif act=='get':
     d=load()
-    v=d.get(a[1]) if len(a)==2 else (d['peers'].get(a[1]) or {}).get(a[2])
+    if len(a)==2 and a[1]=='mtu':
+        v=d.get('mtu',1380)
+    else:
+        v=d.get(a[1]) if len(a)==2 else (d['peers'].get(a[1]) or {}).get(a[2])
     if v is None or isinstance(v,dict): sys.exit(1)
     print(v)
 elif act=='conf':
     d=load()
     out=['# att-tunnel 生成，别手改：以 %s 为准，加/删 WireGuard 节点时重写'%f,
-         '[Interface]','Address = %s.1/24'%d['net'],'ListenPort = %d'%d['port'],'PrivateKey = %s'%d['priv']]
+         '[Interface]','Address = %s.1/24'%d['net'],'ListenPort = %d'%d['port'],
+         'PrivateKey = %s'%d['priv'],'MTU = %d'%d.get('mtu',1380)]
     for n,p in sorted(d['peers'].items(), key=lambda x: ipaddress.ip_address(x[1]['ip'])):
         out+=['','# node: %s'%n,'[Peer]','PublicKey = %s'%p['pub'],'PresharedKey = %s'%p['psk'],
               'AllowedIPs = %s/32'%p['ip']]
@@ -506,6 +527,7 @@ wg_apply(){
   local tmp; tmp=$(mktemp)
   wg_state conf > "$tmp" || { rm -f "$tmp"; die "生成 WireGuard 配置失败"; }
   install -m 600 "$tmp" "$WG_CONF"; rm -f "$tmp"
+  local mtu; mtu=$(wg_state get mtu 2>/dev/null || echo 1380)
   systemctl enable "wg-quick@$WG_IF" >/dev/null 2>&1 || true
   if ip link show "$WG_IF" >/dev/null 2>&1; then
     wg syncconf "$WG_IF" <(wg-quick strip "$WG_CONF") || die "WireGuard 配置热更新失败"
@@ -514,6 +536,7 @@ wg_apply(){
       journalctl -u "wg-quick@$WG_IF" -n 10 --no-pager 2>&1 | tail -8
       die "WireGuard 接口 $WG_IF 起不来"; }
   fi
+  ip link set dev "$WG_IF" mtu "$mtu" >/dev/null 2>&1 || warn "WireGuard MTU 设置失败（$mtu）"
   ip link show "$WG_IF" >/dev/null 2>&1 || die "WireGuard 接口 $WG_IF 没起来"
 }
 
@@ -521,13 +544,14 @@ wg_apply(){
 wg_server_ensure(){
   wg_require
   if [ ! -s "$WG_STATE" ]; then
-    local port="${ATT_WG_PORT:-}" net="${ATT_WG_NET:-10.77.0}" priv pub
+    local port="${ATT_WG_PORT:-}" net="${ATT_WG_NET:-10.77.0}" mtu="${ATT_WG_MTU:-1380}" priv pub
     [ -n "$port" ] || port=$(free_udp_port)
     [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "ATT_WG_PORT 不对：$port"
     [[ "$net" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || die "ATT_WG_NET 要写成三段，如 10.77.0"
+    [[ "$mtu" =~ ^[0-9]{4}$ ]] && [ "$mtu" -ge 1280 ] && [ "$mtu" -le 1420 ] || die "ATT_WG_MTU 不对：$mtu（1280-1420）"
     priv=$(wg genkey); pub=$(printf '%s' "$priv" | wg pubkey)
     mkdir -p "$STATE"
-    WG_PRIV="$priv" WG_PUB="$pub" wg_state init "$port" "$net"
+    WG_PRIV="$priv" WG_PUB="$pub" wg_state init "$port" "$net" "$mtu"
     ok "WireGuard 已初始化：UDP $port，隧道网段 $net.0/24"
   fi
   wg_apply
@@ -542,9 +566,10 @@ print_wg_cmd(){
   [ -s "$WG_STATE" ] || die "本机还没有 WireGuard 节点"
   local ip; ip=$(wg_state get "$name" ip) || die "WireGuard 里没有节点 $name 的记录（跑菜单 8 自检）"
   local token
-  token=$(printf 'wg1|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$A_IP" "$(wg_state get port)" "$(wg_state get pub)" \
+  token=$(printf 'wg2|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$A_IP" "$(wg_state get port)" "$(wg_state get pub)" \
     "$(wg_state get "$name" priv)" "$(wg_state get "$name" psk)" "$ip" "$(wg_state get net).1" \
-    "$(wg_state get "$name" xport)" "$(wg_state get "$name" uuid)" | base64 -w0)
+    "$(wg_state get "$name" xport)" "$(wg_state get "$name" uuid)" \
+    "$(wg_state get mtu)" "${ATT_WG_KEEPALIVE:-15}" | base64 -w0)
   echo
   echo "${BLD}到这个节点的落地机${name:+（$name，WireGuard）}上执行：${RST}"
   echo
@@ -950,17 +975,23 @@ EOF
 }
 
 # ================= 服务器 B：WireGuard 出口 =================
-# token = base64(wg1|A公网IP|A的UDP口|A公钥|B私钥|预共享密钥|B隧道IP|A隧道IP|B的Xray口|uuid)
+# token = base64(wg2|A公网IP|A的UDP口|A公钥|B私钥|预共享密钥|B隧道IP|A隧道IP|B的Xray口|uuid|MTU|Keepalive)
+# 兼容旧 wg1 token（无 MTU/keepalive 字段，自动用默认值）
 # B 主动拨 A（PersistentKeepalive），公网零入站；Xray 只听在自己的隧道 IP 上，WG 只认 A 一个 peer。
 deploy_wg_b(){
   need_root
   local token="${1:-}"
   [ -n "$token" ] || die "缺少 token，请用 A 端输出的完整命令"
   [ -f "$STATE/a.env" ] && die "本机是 A 端（入口机），不能同时当落地机"
-  local dec ver aip wport apub bpriv psk bip ain xport uuid
+  local dec ver aip wport apub bpriv psk bip ain xport uuid wg_mtu wg_keepalive
   dec=$(printf '%s' "$token" | base64 -d 2>/dev/null) || die "token 解析失败"
-  IFS='|' read -r ver aip wport apub bpriv psk bip ain xport uuid <<<"$dec"
-  [ "$ver" = wg1 ] || die "这不是 WireGuard 出口的 token（VLESS 反向用 --bridge）"
+  IFS='|' read -r ver aip wport apub bpriv psk bip ain xport uuid wg_mtu wg_keepalive <<<"$dec"
+  [ "$ver" = wg1 ] || [ "$ver" = wg2 ] || die "这不是 WireGuard 出口的 token（VLESS 反向用 --bridge）"
+  wg_mtu="${wg_mtu:-1380}"; wg_keepalive="${wg_keepalive:-15}"
+  [[ "$wg_mtu" =~ ^[0-9]{4}$ ]] && [ "$wg_mtu" -ge 1280 ] && [ "$wg_mtu" -le 1420 ] \
+    || die "token 里的 WG MTU 不对：$wg_mtu（1280-1420）"
+  [[ "$wg_keepalive" =~ ^[0-9]{1,2}$ ]] && [ "$wg_keepalive" -ge 5 ] && [ "$wg_keepalive" -le 60 ] \
+    || die "token 里的 WG keepalive 不对：$wg_keepalive（5-60）"
   local k='^[A-Za-z0-9+/]{43}=$' i4='^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
   [[ "$aip" =~ ^[A-Za-z0-9.:-]{2,253}$ ]] && [[ "$wport" =~ ^[0-9]{1,5}$ ]] && [[ "$xport" =~ ^[0-9]{1,5}$ ]] \
     && [[ "$apub" =~ $k ]] && [[ "$bpriv" =~ $k ]] && [[ "$psk" =~ $k ]] \
@@ -981,13 +1012,14 @@ deploy_wg_b(){
 [Interface]
 Address = $bip/32
 PrivateKey = $bpriv
+MTU = $wg_mtu
 
 [Peer]
 PublicKey = $apub
 PresharedKey = $psk
 Endpoint = $ep:$wport
 AllowedIPs = $ain/32
-PersistentKeepalive = 15
+PersistentKeepalive = $wg_keepalive
 EOF
   install -m 600 "$wtmp" "$WG_CONF"; rm -f "$wtmp"
   systemctl enable "wg-quick@$WG_IF" >/dev/null 2>&1 || true
@@ -996,7 +1028,7 @@ EOF
     die "WireGuard 接口 $WG_IF 起不来"; }
   # Xray 要听在隧道 IP 上：开机时必须等 attwg 起来再启动
   mkdir -p "$(dirname "$WG_DROPIN")"
-  printf '[Unit]\nAfter=wg-quick@%s.service\nWants=wg-quick@%s.service\n' "$WG_IF" "$WG_IF" > "$WG_DROPIN"
+  printf '[Unit]\nBindsTo=wg-quick@%s.service\nAfter=wg-quick@%s.service\nWants=wg-quick@%s.service\n' "$WG_IF" "$WG_IF" "$WG_IF" > "$WG_DROPIN"
 
   local tmp; tmp=$(mktemp --suffix=.json)
   cat > "$tmp" <<EOF
@@ -1009,7 +1041,7 @@ EOF
       "port": $xport,
       "protocol": "vless",
       "settings": { "clients": [ { "id": "$uuid", "email": "wg" } ], "decryption": "none" },
-      "streamSettings": { "network": "raw" }
+      "streamSettings": { "network": "raw", "sockopt": { "tcpKeepAliveInterval": 10, "tcpKeepAliveIdle": 30, "tcpUserTimeout": 12000 } }
     }
   ],
   "outbounds": [
@@ -1540,7 +1572,7 @@ if kind=='wg':
     obs.append({'tag':ptag,'protocol':'vless',
                 'settings':{'address':os.environ['NEW_WGIP'],'port':int(os.environ['NEW_WGX']),
                             'id':buuid,'encryption':'none'},
-                'streamSettings':{'network':'raw'}})
+                'streamSettings':{'network':'raw','sockopt':{'tcpKeepAliveInterval':10,'tcpKeepAliveIdle':30,'tcpUserTimeout':12000}}})
 else:
     # 严格 1:1：这个节点自己的 bridge client + 自己的 portal 标签
     for ib in d['inbounds']:
