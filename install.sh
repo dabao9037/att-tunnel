@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.5.3"
+VERSION="2.5.4"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -318,7 +318,8 @@ harden_service(){
 
 # A 侧必需：B 换 IP 后会留下一条僵死隧道，portal 仍会往里派流量，
 # 导致部分请求挂死。内核默认 tcp_retries2=15（约 15 分钟）太长，
-# 调到 5（约 20 秒）才能快速回收。实测：调之前 6/8，调之后 10/10。
+# 调到 8（约 100 秒）：既能让僵死连接回收，又不会在直播丢包时像 5 那样
+# 约 15–20 秒就断流。实测：5 的回收更快，但会误杀直播长连接。
 # 同时开 BBR：A↔B 是一条长 TCP 隧道，跨国线路偶发丢包时 cubic 会把窗口砍半、掉速很久，
 # BBR 按带宽和 RTT 估算发送速率，丢包时掉速小得多。内核 4.9+ 才有；不支持就跳过，不影响隧道。
 bbr_supported(){
@@ -332,7 +333,7 @@ tune_tcp(){
   bbr_supported && bbr=1
   {
     echo "# att-tunnel: 快速回收死掉的反向隧道连接（B 换 IP / 断网场景）"
-    echo "net.ipv4.tcp_retries2 = 5"
+    echo "net.ipv4.tcp_retries2 = 8"
     if [ "$bbr" = 1 ]; then
       echo "# att-tunnel: BBR 拥塞控制 + fq 队列（丢包时不像 cubic 那样大幅掉速）"
       echo "net.core.default_qdisc = fq"
@@ -349,7 +350,7 @@ tune_tcp(){
   # 开机自动加载 bbr 模块（编进内核的不需要，写了也无害）
   [ "$bbr" = 1 ] && [ -d /etc/modules-load.d ] && echo tcp_bbr > /etc/modules-load.d/att-tunnel-bbr.conf
   # 逐项生效：容器里 default_qdisc 可能不让改，不能连累其它项
-  sysctl -w net.ipv4.tcp_retries2=5 >/dev/null 2>&1 && ok "已调优 tcp_retries2=5（僵死隧道 ~20s 回收）" \
+  sysctl -w net.ipv4.tcp_retries2=8 >/dev/null 2>&1 && ok "已调优 tcp_retries2=8（僵死隧道 ~100s 回收，直播不误杀）" \
     || warn "sysctl 应用失败，僵死连接回收会变慢"
   if [ "$bbr" = 1 ]; then
     sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
@@ -368,18 +369,74 @@ tune_tcp(){
   done
 }
 
-# 老机器单独补调优（不重装、不动配置和节点）：--tune
+# 把 2.5.3 给 WG 节点写的 12 秒 tcpUserTimeout 改成 60 秒。
+# 只改这一种值，不动节点、端口、UUID 或其他 sockopt；校验失败自动保留原配置。
+relax_xray_timeouts(){
+  [ -f "$CFG" ] || return 1
+  [ -x "$XRAY_BIN" ] || { warn "找不到 $XRAY_BIN，跳过 TCP 超时修复"; return 1; }
+  local tmp rc=0
+  tmp=$(mktemp --suffix=.json)
+  ATT_CFG="$CFG" ATT_OUT="$tmp" python3 - <<'PY' || rc=$?
+import json, os, sys
+with open(os.environ['ATT_CFG']) as f:
+    d = json.load(f)
+changed = 0
+def walk(x):
+    global changed
+    if isinstance(x, dict):
+        if x.get('tcpUserTimeout') == 12000:
+            x['tcpUserTimeout'] = 60000
+            changed += 1
+        for v in x.values():
+            walk(v)
+    elif isinstance(x, list):
+        for v in x:
+            walk(v)
+walk(d)
+if not changed:
+    sys.exit(2)
+with open(os.environ['ATT_OUT'], 'w') as f:
+    json.dump(d, f, ensure_ascii=False, indent=1)
+PY
+  if [ "$rc" = 2 ]; then
+    rm -f "$tmp"; return 1
+  fi
+  if [ "$rc" != 0 ]; then
+    rm -f "$tmp"; warn "TCP 超时配置解析失败，保持原样"; return 1
+  fi
+  if ! "$XRAY_BIN" -test -config "$tmp" >/dev/null 2>&1; then
+    "$XRAY_BIN" -test -config "$tmp" 2>&1 | tail -5
+    rm -f "$tmp"; warn "TCP 超时配置校验失败，保持原样"; return 1
+  fi
+  cp "$CFG" "$CFG.bak-tcp-timeout-$(date +%Y%m%d%H%M%S)" || {
+    rm -f "$tmp"; warn "备份配置失败，保持原样"; return 1; }
+  mv "$tmp" "$CFG" || {
+    rm -f "$tmp"; warn "写入配置失败，保持原样"; return 1; }
+  chmod 644 "$CFG" 2>/dev/null || true
+  chown root:root "$CFG" 2>/dev/null || true
+  ok "已把旧配置里的 tcpUserTimeout 12000 改为 60000"
+  return 0
+}
+
+# 老机器单独补调优（不重装、不动节点和链接）：--tune
 tune_only(){
   need_root
   tune_tcp
+  local cfg_changed=0
+  if relax_xray_timeouts; then cfg_changed=1; fi
   local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-  if [ "$cc" = bbr ] && systemctl is-active --quiet "$SVC" && [ -f "$STATE/b.env" ]; then
-    # 隧道是 B 拨出去的长连接，建连时定下拥塞算法；重启让它立刻换成 BBR，断几秒自动重连
+  local why=""
+  if [ "$cfg_changed" = 1 ]; then why="TCP 超时修复"; fi
+  if [ "$cc" = bbr ] && [ -f "$STATE/b.env" ]; then
+    why="${why:+$why + }BBR"
+  fi
+  if [ -n "$why" ] && systemctl is-active --quiet "$SVC"; then
+    # 配置/拥塞算法要重启才生效；会断几秒，长连接会自动重连
     if noninteractive || [ "${ATT_YES:-}" = 1 ]; then
-      systemctl restart "$SVC" && ok "已重启 $SVC，隧道已用 BBR 重连"
+      systemctl restart "$SVC" && ok "已重启 $SVC（$why）"
     else
-      read -rp "重启 $SVC 让现有隧道立刻改用 BBR？会断几秒 [y/N]: " yn
-      case "$yn" in [yY]*) systemctl restart "$SVC" && ok "已重启 $SVC，隧道已用 BBR 重连" ;; *) info "不重启：隧道下次重连时自动用 BBR" ;; esac
+      read -rp "重启 $SVC 让 $why 生效？会断几秒 [y/N]: " yn
+      case "$yn" in [yY]*) systemctl restart "$SVC" && ok "已重启 $SVC（$why）" ;; *) info "不重启：下次重连时自动生效" ;; esac
     fi
   fi
 }
@@ -1041,7 +1098,7 @@ EOF
       "port": $xport,
       "protocol": "vless",
       "settings": { "clients": [ { "id": "$uuid", "email": "wg" } ], "decryption": "none" },
-      "streamSettings": { "network": "raw", "sockopt": { "tcpKeepAliveInterval": 10, "tcpKeepAliveIdle": 30, "tcpUserTimeout": 12000 } }
+      "streamSettings": { "network": "raw", "sockopt": { "tcpKeepAliveInterval": 10, "tcpKeepAliveIdle": 30, "tcpUserTimeout": 60000 } }
     }
   ],
   "outbounds": [
@@ -1572,7 +1629,7 @@ if kind=='wg':
     obs.append({'tag':ptag,'protocol':'vless',
                 'settings':{'address':os.environ['NEW_WGIP'],'port':int(os.environ['NEW_WGX']),
                             'id':buuid,'encryption':'none'},
-                'streamSettings':{'network':'raw','sockopt':{'tcpKeepAliveInterval':10,'tcpKeepAliveIdle':30,'tcpUserTimeout':12000}}})
+                'streamSettings':{'network':'raw','sockopt':{'tcpKeepAliveInterval':10,'tcpKeepAliveIdle':30,'tcpUserTimeout':60000}}})
 else:
     # 严格 1:1：这个节点自己的 bridge client + 自己的 portal 标签
     for ib in d['inbounds']:
@@ -3438,7 +3495,7 @@ selfcheck(){
       fi
       if [ "$nexit" -gt 0 ] && [ "$ntun" -gt "$nexit" ]; then
         warn "隧道数多于出口数 —— 可能有僵死连接（某台 B 刚换过 IP）"
-        warn "部分请求会挂死，等 ~20s 内核回收；若长期如此查：sysctl net.ipv4.tcp_retries2（应为 5）"
+        warn "部分请求会挂死，等 ~100s 内核回收；若长期如此查：sysctl net.ipv4.tcp_retries2（应为 8）"
       fi
     fi
     if [ -s "$WG_STATE" ]; then
@@ -3459,7 +3516,7 @@ selfcheck(){
       fi
     fi
     local r2; r2=$(sysctl -n net.ipv4.tcp_retries2 2>/dev/null)
-    [ "$r2" = 5 ] && ok "tcp_retries2=5（僵死隧道快速回收）" || warn "tcp_retries2=$r2，建议为 5"
+    [ "$r2" = 8 ] && ok "tcp_retries2=8（僵死隧道回收，直播不误杀）" || warn "tcp_retries2=$r2，建议为 8"
     check_bbr
     echo; info "逐个节点验收：连上后查出口 IP，必须等于${BLD}它对应那台出口机的实时公网 IP${RST}"
     info "如果显示的是 A 的 IP（$A_IP），说明该节点的流量没进 portal"

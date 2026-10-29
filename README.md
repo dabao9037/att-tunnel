@@ -240,7 +240,7 @@ bash install.sh --del node2   # 非交互指定
 
 4. **`xray -test` 按扩展名判断格式**，`mktemp` 不带后缀会报 `Failed to get format`。
 
-5. **B 换 IP 后 A 侧会留一条僵死隧道**，portal 仍往里派流量，导致约 1/4 请求挂死。`tcpUserTimeout` 对 accept 出来的连接不生效；真正有效的是内核 `tcp_retries2`（默认 15 ≈ 15 分钟）。脚本设为 5（≈20 秒）。实测：调之前 6/8，调之后 10/10。
+5. **B 换 IP 后 A 侧会留一条僵死隧道**，portal 仍往里派流量，导致约 1/4 请求挂死。真正有效的是内核 `tcp_retries2`（默认 15 ≈ 15 分钟）。脚本设为 8（≈100 秒）；5 的回收更快（实测 6/8→10/10），但直播丢包时约 15–20 秒就会断流。WireGuard 节点的 `tcpUserTimeout` 也从 12 秒放宽到 60 秒。
 
 7. **新版 Xray（26.4+）已移除旧 `reverse` 语法**。旧写法（顶层 `reverse.portals/bridges` + 虚拟域名路由）会直接报 `The feature "legacy reverse" has been removed`。新写法是在 VLESS user 上写 `"reverse": {"tag": "portal"}`，B 侧 outbound 必须用 simplified style（`address`/`port`/`id` 平铺，不能用 `vnext`）。脚本会自动探测用哪一代并生成对应配置。
 
