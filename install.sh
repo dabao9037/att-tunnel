@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.5.6"
+VERSION="2.5.7"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -328,6 +328,31 @@ bbr_supported(){
   grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null
 }
 
+set_fq_flow_limit(){
+  local dev tcbin
+  dev=$(ip route show default 2>/dev/null | awk 'NR==1{print $5}')
+  [ -n "$dev" ] || return 0
+  tcbin=$(command -v tc 2>/dev/null || echo /usr/sbin/tc)
+  "$tcbin" qdisc change dev "$dev" root fq flow_limit 2048 2>/dev/null || \
+    "$tcbin" qdisc replace dev "$dev" root fq flow_limit 2048 2>/dev/null || true
+  cat > /etc/systemd/system/att-tunnel-fq.service <<UNIT
+[Unit]
+Description=att-tunnel fq flow_limit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=-$tcbin qdisc replace dev $dev root fq flow_limit 2048
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now att-tunnel-fq.service >/dev/null 2>&1 || true
+}
+
 tune_tcp(){
   local f=/etc/sysctl.d/99-att-tunnel.conf bbr=0
   bbr_supported && bbr=1
@@ -369,6 +394,7 @@ tune_tcp(){
     sysctl -w "$kv" >/dev/null 2>&1 || true
   done
   sysctl --system >/dev/null 2>&1 || true
+  if [ -f "$STATE/a.env" ]; then set_fq_flow_limit; fi
 }
 
 # 把 2.5.3 给 WG 节点写的 12 秒 tcpUserTimeout 改成 60 秒。
@@ -881,6 +907,7 @@ STATS_API_PORT=$STATS_API_PORT
 PROBE_PORT=$PROBE_PORT
 EOF
   chmod 600 "$STATE/a.env"
+  set_fq_flow_limit
 
   local token
   token=$(printf '%s|%s|%s|%s|%s' "$aip" "$rport" "$buuid" "$enc" "$REVERSE_STYLE" | base64 -w0)
