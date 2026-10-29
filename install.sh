@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.5.5"
+VERSION="2.5.6"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -420,10 +420,46 @@ PY
   return 0
 }
 
+# 2.5.2 的 WireGuard MTU 是 1420；把已安装的节点也迁移到 1420。
+# A: 改 wg.json 的 mtu 后 wg_apply；B: 改 attwg.conf 的 MTU 并热改接口。
+set_wg_mtu_1420(){
+  local changed=0
+  if [ -s "$WG_STATE" ]; then
+    local cur; cur=$(wg_state get mtu 2>/dev/null || echo "")
+    if [ -n "$cur" ] && [ "$cur" != 1420 ]; then
+      cp "$WG_STATE" "$WG_STATE.bak-mtu-$(date +%Y%m%d%H%M%S)" || {
+        warn "备份 wg.json 失败，跳过 MTU 迁移"; return 1; }
+      ATT_WG_STATE="$WG_STATE" python3 - <<'PY' || { warn "更新 wg.json MTU 失败"; return 1; }
+import json, os
+p=os.environ['ATT_WG_STATE']
+with open(p) as f: d=json.load(f)
+d['mtu']=1420
+with open(p+'.tmp','w') as f: json.dump(d,f,indent=1)
+os.chmod(p+'.tmp',0o600)
+os.replace(p+'.tmp',p)
+PY
+      if wg_apply; then changed=1; else warn "wg_apply 失败，MTU 迁移未完成"; fi
+    fi
+  fi
+  if [ -f "$STATE/b.env" ] && [ -f "$WG_CONF" ]; then
+    local cur; cur=$(awk -F'= ' '/^MTU = /{print $2; exit}' "$WG_CONF" 2>/dev/null)
+    if [ -n "$cur" ] && [ "$cur" != 1420 ]; then
+      cp "$WG_CONF" "$WG_CONF.bak-mtu-$(date +%Y%m%d%H%M%S)" || {
+        warn "备份 $WG_CONF 失败，跳过 MTU 迁移"; return 1; }
+      sed -i 's/^MTU = .*/MTU = 1420/' "$WG_CONF" || { warn "写入 MTU 失败"; return 1; }
+      ip link set dev "$WG_IF" mtu 1420 >/dev/null 2>&1 || warn "设置 $WG_IF MTU 失败"
+      changed=1
+    fi
+  fi
+  if [ "$changed" = 1 ]; then ok "已把 WireGuard MTU 迁移为 1420"; fi
+  return 0
+}
+
 # 老机器单独补调优（不重装、不动节点和链接）：--tune
 tune_only(){
   need_root
   tune_tcp
+  set_wg_mtu_1420 || warn "WireGuard MTU 迁移失败，保持原值"
   local cfg_changed=0
   if relax_xray_timeouts; then cfg_changed=1; fi
   local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
@@ -538,7 +574,7 @@ def save(d):
     with os.fdopen(fd,'w') as h: json.dump(d,h,indent=1)
     os.replace(tmp,f)
 if act=='init':
-    save({'port':int(a[1]),'net':a[2],'mtu':int(a[3]) if len(a)>3 else 1380,
+    save({'port':int(a[1]),'net':a[2],'mtu':int(a[3]) if len(a)>3 else 1420,
           'priv':E('WG_PRIV'),'pub':E('WG_PUB'),'peers':{}})
 elif act=='alloc':
     # 给 NAME 挑隧道 IP；不在保留列表里的残留 peer（加节点中途失败留下的）不占位
@@ -561,7 +597,7 @@ elif act=='del':
 elif act=='get':
     d=load()
     if len(a)==2 and a[1]=='mtu':
-        v=d.get('mtu',1380)
+        v=d.get('mtu',1420)
     else:
         v=d.get(a[1]) if len(a)==2 else (d['peers'].get(a[1]) or {}).get(a[2])
     if v is None or isinstance(v,dict): sys.exit(1)
@@ -570,7 +606,7 @@ elif act=='conf':
     d=load()
     out=['# att-tunnel 生成，别手改：以 %s 为准，加/删 WireGuard 节点时重写'%f,
          '[Interface]','Address = %s.1/24'%d['net'],'ListenPort = %d'%d['port'],
-         'PrivateKey = %s'%d['priv'],'MTU = %d'%d.get('mtu',1380)]
+         'PrivateKey = %s'%d['priv'],'MTU = %d'%d.get('mtu',1420)]
     for n,p in sorted(d['peers'].items(), key=lambda x: ipaddress.ip_address(x[1]['ip'])):
         out+=['','# node: %s'%n,'[Peer]','PublicKey = %s'%p['pub'],'PresharedKey = %s'%p['psk'],
               'AllowedIPs = %s/32'%p['ip']]
@@ -586,7 +622,7 @@ wg_apply(){
   local tmp; tmp=$(mktemp)
   wg_state conf > "$tmp" || { rm -f "$tmp"; die "生成 WireGuard 配置失败"; }
   install -m 600 "$tmp" "$WG_CONF"; rm -f "$tmp"
-  local mtu; mtu=$(wg_state get mtu 2>/dev/null || echo 1380)
+  local mtu; mtu=$(wg_state get mtu 2>/dev/null || echo 1420)
   systemctl enable "wg-quick@$WG_IF" >/dev/null 2>&1 || true
   if ip link show "$WG_IF" >/dev/null 2>&1; then
     wg syncconf "$WG_IF" <(wg-quick strip "$WG_CONF") || die "WireGuard 配置热更新失败"
@@ -603,7 +639,7 @@ wg_apply(){
 wg_server_ensure(){
   wg_require
   if [ ! -s "$WG_STATE" ]; then
-    local port="${ATT_WG_PORT:-}" net="${ATT_WG_NET:-10.77.0}" mtu="${ATT_WG_MTU:-1380}" priv pub
+    local port="${ATT_WG_PORT:-}" net="${ATT_WG_NET:-10.77.0}" mtu="${ATT_WG_MTU:-1420}" priv pub
     [ -n "$port" ] || port=$(free_udp_port)
     [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "ATT_WG_PORT 不对：$port"
     [[ "$net" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || die "ATT_WG_NET 要写成三段，如 10.77.0"
@@ -1046,7 +1082,7 @@ deploy_wg_b(){
   dec=$(printf '%s' "$token" | base64 -d 2>/dev/null) || die "token 解析失败"
   IFS='|' read -r ver aip wport apub bpriv psk bip ain xport uuid wg_mtu wg_keepalive <<<"$dec"
   [ "$ver" = wg1 ] || [ "$ver" = wg2 ] || die "这不是 WireGuard 出口的 token（VLESS 反向用 --bridge）"
-  wg_mtu="${wg_mtu:-1380}"; wg_keepalive="${wg_keepalive:-15}"
+  wg_mtu="${wg_mtu:-1420}"; wg_keepalive="${wg_keepalive:-15}"
   [[ "$wg_mtu" =~ ^[0-9]{4}$ ]] && [ "$wg_mtu" -ge 1280 ] && [ "$wg_mtu" -le 1420 ] \
     || die "token 里的 WG MTU 不对：$wg_mtu（1280-1420）"
   [[ "$wg_keepalive" =~ ^[0-9]{1,2}$ ]] && [ "$wg_keepalive" -ge 5 ] && [ "$wg_keepalive" -le 60 ] \
