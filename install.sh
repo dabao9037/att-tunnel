@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.5.4"
+VERSION="2.5.5"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -341,10 +341,6 @@ tune_tcp(){
     fi
     echo "net.ipv4.tcp_slow_start_after_idle = 0"
     echo "net.ipv4.tcp_mtu_probing = 1"
-    echo "net.core.rmem_max = 16777216"
-    echo "net.core.wmem_max = 16777216"
-    echo "net.ipv4.tcp_rmem = 4096 87380 16777216"
-    echo "net.ipv4.tcp_wmem = 4096 65536 16777216"
     echo "net.core.netdev_max_backlog = 16384"
   } > "$f"
   # 开机自动加载 bbr 模块（编进内核的不需要，写了也无害）
@@ -363,10 +359,16 @@ tune_tcp(){
     warn "内核不支持 BBR（$(uname -r)），沿用 $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   fi
   for kv in net.ipv4.tcp_slow_start_after_idle=0 net.ipv4.tcp_mtu_probing=1 \
-            net.core.rmem_max=16777216 net.core.wmem_max=16777216 \
             net.core.netdev_max_backlog=16384; do
     sysctl -w "$kv" >/dev/null 2>&1 || true
   done
+  # 2.5.2 不覆盖 TCP 缓冲；先把旧版的 16MB 值恢复成常规默认，
+  # 再让本机自己的 sysctl.d（例如 99-tcpfit.conf）覆盖。
+  for kv in net.core.rmem_max=212992 net.core.wmem_max=212992 \
+            "net.ipv4.tcp_rmem=4096 87380 6291456" "net.ipv4.tcp_wmem=4096 16384 4194304"; do
+    sysctl -w "$kv" >/dev/null 2>&1 || true
+  done
+  sysctl --system >/dev/null 2>&1 || true
 }
 
 # 把 2.5.3 给 WG 节点写的 12 秒 tcpUserTimeout 改成 60 秒。
