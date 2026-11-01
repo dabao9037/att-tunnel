@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 下面统一用 sed -n / awk NR 代替 head；再加个 ERR 提示，万一意外退出至少知道是哪一行。
 trap 'rc=$?; echo "[X] 脚本在第 $LINENO 行意外退出 (rc=$rc)" >&2' ERR
 
-VERSION="2.5.7"
+VERSION="2.5.8"
 XRAY_BIN="/usr/local/bin/xray"
 # 独立配置 + 独立 systemd 服务，不碰机器上已有的 xray / 3x-ui / NodeLite
 CFG_DIR="/usr/local/etc/att-tunnel"
@@ -2508,7 +2508,8 @@ def status_json():
                         'up': r['up'], 'down': r['down'], 'total': r['up'] + r['down'],
                         'rate_up': r['rate_up'], 'rate_down': r['rate_down'],
                         'hist': [h[1] + h[2] for h in r['hist'][-40:]],
-                        'src_user': r['cnt_user'], 'src_exit': r['cnt_exit'], 'since': r['since']})
+                        'src_user': r['cnt_user'], 'src_exit': r['cnt_exit'], 'since': r['since'],
+                        'ssh': ssh_view(n['name'])})
         rp = a.get('REVERSE_PORT', '')
         return {'now': t, 'version': VERSION, 'a_ip': a.get('A_IP', ''), 'wg': wg_info(),
                 'reverse_port': rp, 'tunnels': tunnel_count(int(rp)) if rp.isdigit() else 0,
@@ -2682,6 +2683,7 @@ def ssh_install_bridge(host, port, user, password, key_text, exit_cmd, log_cb=No
 export DEBIAN_FRONTEND=noninteractive
 trap 'rm -f /tmp/att-bridge.sh' EXIT
 cd /tmp
+echo "@@STEP@@ 20 下载安装脚本…"
 if command -v curl >/dev/null 2>&1 && curl -fsSL --max-time 60 {url} -o /tmp/att-bridge.sh; then
   :
 elif command -v wget >/dev/null 2>&1 && wget -q -O /tmp/att-bridge.sh {url}; then
@@ -2699,6 +2701,7 @@ else
   exit 127
 fi
 if [ "$(id -u)" -eq 0 ]; then
+  echo "@@STEP@@ 55 安装依赖和 xray（第一次要下载，可能几分钟）…"
   ATT_NONINTERACTIVE=1 ATT_RAW_URL={url} bash /tmp/att-bridge.sh {flag} {token}
 else
   if ! command -v sudo >/dev/null 2>&1; then
@@ -2715,6 +2718,7 @@ else
     exit 126
   fi
 fi
+echo "@@STEP@@ 100 安装完成"
 '''.format(url=shlex.quote(url), flag=flag, token=shlex.quote(token),
            sudo_pass=shlex.quote(password or ''))
 
@@ -2752,12 +2756,48 @@ fi
         cmd += ['%s@%s' % (user, host), 'bash -s']
         if log_cb:
             log_cb('连接 %s@%s:%s …' % (user, host, port))
-        p = subprocess.run(cmd, input=remote, capture_output=True, text=True,
-                           timeout=900, env=env)
-        txt = ANSI_RE.sub('', (p.stdout or '') + (p.stderr or ''))
-        return p.returncode, txt.strip()[-6000:]
-    except subprocess.TimeoutExpired:
-        return 124, 'SSH 安装超时（900 秒），出口机上可能仍在跑，稍后看节点是否上线'
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+        timed_out = {'v': False}
+
+        def _kill():
+            timed_out['v'] = True
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+        killer = threading.Timer(900, _kill)
+        killer.start()
+        lines = []
+        try:
+            try:
+                p.stdin.write(remote)
+                p.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            for raw in p.stdout:
+                ln = ANSI_RE.sub('', raw.rstrip('\r\n'))
+                lines.append(ln)
+                if len(lines) > 400:
+                    del lines[:len(lines) - 400]
+                if log_cb:
+                    try:
+                        log_cb(ln)
+                    except Exception:
+                        pass
+            rc = p.wait()
+        finally:
+            killer.cancel()
+            if p.poll() is None:
+                p.kill()
+            try:
+                p.stdout.close()
+            except Exception:
+                pass
+        if timed_out['v']:
+            return 124, 'SSH 安装超时（900 秒），出口机上可能仍在跑，稍后看节点是否上线'
+        return rc, '\n'.join(lines).strip()[-6000:]
     except OSError as e:
         return 1, 'SSH 执行失败：%s' % e
     finally:
@@ -2775,40 +2815,107 @@ fi
 # SSH 安装任务：装出口机要跑几分钟，而面板经 hub 代理访问时代理只等 280s，
 # 同步做必然 504。所以丢后台线程跑，前端轮询 /api/ssh-status 看进度。
 ssh_jobs = {}
+ssh_node_job = {}         # 节点名 -> 最近一次 SSH 任务（页面刷新后还能找回进度）
 SSH_JOB_TTL = 3600
+SSH_STEP_RE = re.compile(r'^@@STEP@@\s+(\d{1,3})\s*(.*)$')
+# 安装脚本自身的输出 → 更细的阶段（pct, 文案）
+SSH_STAGE_HINTS = (
+    ('安装依赖:', 58, '安装系统依赖（apt）…'),
+    ('安装专用 Xray-core', 68, '下载安装 xray（第一次最慢）…'),
+    ('将主动拨向', 82, '写入配置并启动 xray…'),
+    ('等待反向隧道建立', 92, '等待隧道建立…'),
+    ('部署完成', 97, '安装完成，等隧道上线'),
+)
 
 
-def ssh_job_new(node):
+def ssh_job_new(node, target=''):
     jid = secrets.token_urlsafe(12)
     with lock:
         t = now()
         for k in [k for k, v in ssh_jobs.items() if v['done'] and t - v['ts'] > SSH_JOB_TTL]:
+            nm = ssh_jobs[k].get('node')
+            if ssh_node_job.get(nm) == k:
+                ssh_node_job.pop(nm, None)
             del ssh_jobs[k]
-        ssh_jobs[jid] = {'node': node, 'state': '正在连接…', 'log': '',
-                         'rc': None, 'done': False, 'ts': t}
+        ssh_jobs[jid] = {'node': node, 'target': target, 'state': '排队中…', 'pct': 5,
+                         'log': [], 'rc': None, 'done': False, 'ts': t, 'started': t}
+        ssh_node_job[node] = jid
     return jid
 
 
 def ssh_job_set(jid, **kw):
     with lock:
         j = ssh_jobs.get(jid)
-        if j:
-            j.update(kw, ts=now())
+        if not j:
+            return
+        j.update(kw, ts=now())
+        if kw.get('done') and not j.get('finished'):
+            j['finished'] = now()
+
+
+def ssh_job_line(jid, line):
+    """SSH 输出一行：写进日志，并按标记/已知输出推进阶段。"""
+    line = ANSI_RE.sub('', line or '').strip()[:800]
+    if not line:
+        return
+    m = SSH_STEP_RE.match(line)
+    if m:
+        try:
+            pct = max(0, min(100, int(m.group(1))))
+        except ValueError:
+            pct = 0
+        ssh_job_set(jid, state=(m.group(2).strip() or '安装中…'), pct=pct)
+        return
+    st = None
+    for pat, pct, text in SSH_STAGE_HINTS:
+        if pat in line:
+            st = (pct, text)
+            break
+    with lock:
+        j = ssh_jobs.get(jid)
+        if not j:
+            return
+        buf = j.setdefault('log', [])
+        buf.append(line)
+        if len(buf) > 200:
+            del buf[:len(buf) - 200]
+        j['ts'] = now()
+    if st:
+        ssh_job_set(jid, pct=st[0], state=st[1])
+
+
+def ssh_view(node):
+    """把某节点当前的 SSH 安装进度给页用（没有任务返回 None）。"""
+    with lock:
+        jid = ssh_node_job.get(node)
+        j = ssh_jobs.get(jid) if jid else None
+        if not j:
+            return None
+        return {'job': jid, 'target': j.get('target', ''), 'state': j['state'],
+                'pct': j.get('pct', 0), 'done': bool(j['done']), 'rc': j['rc'],
+                'started': j.get('started', j['ts']),
+                'elapsed': max(0, (j.get('finished') or now()) - j.get('started', j['ts']))}
 
 
 def ssh_job_run(jid, node, args):
-    """后台线程：在出口机上装 att-tunnel B 端。"""
+    """后台线程：在出口机上装 att-tunnel B 端，输出实时回传面板。"""
     try:
-        ssh_job_set(jid, state='正在连接出口机并安装（首次要装 xray，可能要几分钟）…')
-        rc, out = ssh_install_bridge(*args)
+        ssh_job_set(jid, state='正在连接出口机并安装（首次要装 xray，可能要几分钟）…', pct=10)
+        rc, out = ssh_install_bridge(*args, log_cb=lambda ln: ssh_job_line(jid, ln))
+        extra = {}
+        with lock:
+            j = ssh_jobs.get(jid) or {}
+            pct = j.get('pct', 0)
+            if not j.get('log') and out:
+                extra['log'] = out.splitlines()[-200:]
         if rc == 0:
-            ssh_job_set(jid, state='安装完成，等隧道上线', log=out, rc=0, done=True)
+            ssh_job_set(jid, state='安装完成，等隧道上线', pct=100, rc=0, done=True, **extra)
             threading.Thread(target=probe_all, kwargs={'only': node}, daemon=True).start()
         else:
-            ssh_job_set(jid, state='安装失败（rc=%d）' % rc, log=out, rc=rc, done=True)
+            ssh_job_set(jid, state='安装失败（rc=%d）' % rc, pct=pct, rc=rc, done=True, **extra)
     except Exception as e:
         log('SSH 安装任务异常:', e)
-        ssh_job_set(jid, state='安装异常', log=str(e)[:2000], rc=1, done=True)
+        ssh_job_set(jid, state='安装异常', log=[str(e)[:2000]], rc=1, done=True)
 
 
 
@@ -2888,7 +2995,10 @@ header h1{font-size:19px;margin:0}.hinfo{display:flex;flex-wrap:wrap;gap:6px 16p
 .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:12px 0;font-size:14px}.kv dt{color:var(--mut)}.kv dd{margin:0;word-break:break-all}
 .tr{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0}.tr div{background:var(--bg);border-radius:10px;padding:8px 10px}
 .tr small{color:var(--mut);display:block;font-size:12px}.tr b{font-size:16px}
-.barw{height:6px;background:var(--bg);border-radius:9px;overflow:hidden;margin:6px 0 2px}.bar{height:100%;background:linear-gradient(90deg,var(--pri),#8b5cf6);border-radius:9px}
+.barw{height:6px;background:var(--bg);border-radius:9px;overflow:hidden;margin:6px 0 2px}.bar{height:100%;background:linear-gradient(90deg,var(--pri),#8b5cf6);border-radius:9px;transition:width .5s}
+.spin{display:inline-block;width:11px;height:11px;border:2px solid var(--line);border-top-color:var(--pri);border-radius:50%;animation:sp .9s linear infinite;vertical-align:-1px;margin-right:5px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.sshrow{display:flex;align-items:center;gap:8px;margin-top:6px}.sshrow b{flex:1;font-size:13px;font-weight:600;min-width:0;overflow-wrap:anywhere}
 svg.spark{width:100%;height:34px;display:block}svg.spark path{fill:none;stroke:var(--pri);stroke-width:1.5}
 .nact{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
 .sec{display:flex;align-items:center;justify-content:space-between;margin:20px 0 10px}.sec h3{margin:0;font-size:16px}
@@ -2975,6 +3085,8 @@ return`<section class="card node"><h2><span>${esc(n.name)}</span>${st}</h2><dl c
 <dt>出口 IP</dt><dd class="mono">${esc(n.ip||"—")}</dd><dt>最后探测</dt><dd>${ago(n.probe_ts)}${n.ip_ts&&!n.online?" · 上次在线 "+ago(n.ip_ts):""}</dd>
 <dt>入口</dt><dd>${esc(n.port)} · ${esc(n.sni)}</dd><dt>出口绑定</dt><dd>${esc(n.exit||"未绑定")}${n.exit?(n.kind=="wg"?" · WireGuard":" · VLESS 反向"):""}${n.shared?" ⚠ 共用":""}</dd></dl>
 ${(!n.online&&n.probe_err)?`<div class="err" style="font-size:13px">${esc(n.probe_err)}</div>`:""}
+${n.ssh&&!n.ssh.done?`<div style="margin-top:8px"><div class="barw"><div class="bar" style="width:${n.ssh.pct||3}%"></div></div><div class="mut" style="font-size:12px"><span class="spin"></span>SSH 装出口机 · ${esc(n.ssh.state)} · ${n.ssh.elapsed}s</div></div>`:""}
+${n.ssh&&n.ssh.done&&n.ssh.rc!==0?`<div class="err" style="font-size:13px">SSH 装出口机失败（rc=${n.ssh.rc}）：点「查看链接 / 出口命令」看日志，或手动跑命令。</div>`:""}
 <div class="tr"><div><small>↑ 上传</small><b>${fb(n.up)}</b><small>${fb(n.rate_up)}/s</small></div><div><small>↓ 下载</small><b>${fb(n.down)}</b><small>${fb(n.rate_down)}/s</small></div></div>
 <div class="barw" title="占全部节点最大值的比例"><div class="bar" style="width:${(n.total/mx*100).toFixed(1)}%"></div></div>
 <div class="mut" style="font-size:12px">合计 ${fb(n.total)} · 自 ${ago(n.since)}</div>${spark(n.hist)}
@@ -2989,7 +3101,7 @@ function qrPng(t){const q=qrcodegen.QrCode.encodeText(t,qrcodegen.QrCode.Ecc.MED
 const g=c.getContext("2d");g.fillStyle="#fff";g.fillRect(0,0,n,n);g.fillStyle="#000";for(let y=0;y<q.size;y++)for(let x=0;x<q.size;x++)if(q.getModule(x,y))g.fillRect((x+b)*z,(y+b)*z,z,z);return c.toDataURL("image/png")}
 function qrFig(id,cap,file){return`<figure><img id="${id}" alt="${esc(cap)}"><figcaption>${esc(cap)} · <a id="${id}d" href="#" download="${esc(file)}">下载图片</a></figcaption></figure>`}
 function qrSet(id,t){try{const u=qrPng(t);$(id).src=u;$(id+"d").href=u}catch(e){$(id).replaceWith(Object.assign(document.createElement("p"),{className:"err",textContent:"生成二维码失败："+e.message}))}}
-function showRes(j,title){$("dResH").textContent=title;const nm=j.name||"node",ok=String(j.link||"").startsWith("vless://"),su=j.sub_token?location.origin+P+"/sub/"+encodeURIComponent(j.sub_token):"";
+function showRes(j,title){sshPollGen++;$("dResH").textContent=title;const nm=j.name||"node",ok=String(j.link||"").startsWith("vless://"),su=j.sub_token?location.origin+P+"/sub/"+encodeURIComponent(j.sub_token):"";
 $("resB").innerHTML=`<label>节点链接（导入后核对 flow=xtls-rprx-vision）</label><div class="copy"><span class="mono" id="rL"></span><button class="btn s" type="button" id="cL">复制</button></div>
 ${su?`<label>订阅链接（客户端里「添加订阅 / 从 URL 导入」）</label><div class="copy"><span class="mono" id="rS"></span><button class="btn s" type="button" id="cS">复制</button></div>`:""}
 ${ok?`<div class="qrs">${qrFig("qL","节点链接二维码",nm+"-节点.png")}${su?qrFig("qS","订阅链接二维码",nm+"-订阅.png"):""}</div>`:""}
@@ -3000,27 +3112,37 @@ if(su){$("rS").textContent=su;$("cS").onclick=()=>cp(su)}
 if(ok){qrSet("qL",j.link);if(su)qrSet("qS",su)}
 if(j.ssh_job){const d=document.createElement("div");d.id="sshBox";
   d.innerHTML='<label>SSH 直装出口机 '+esc(j.ssh_target||"")+'</label>'
-    +'<p class="mono" id="sshState" style="margin:4px 0">正在连接…</p>'
+    +'<div class="sshrow"><span class="spin" id="sshSpin"'+(j.ssh_done?' style="display:none"':'')+'></span><b id="sshState">'+esc(j.ssh_state||"正在连接…")+'</b><span class="mut" id="sshTime" style="font-size:12px"></span></div>'
+    +'<div class="barw"><div class="bar" id="sshBar" style="width:5%"></div></div>'
     +'<pre class="out" id="sshOut" hidden></pre>'
-    +'<p class="mut" style="font-size:13px">装出口机首次要下 xray，可能要几分钟。关掉这个窗口也不会中断，上面的命令仍可备用。</p>';
+    +'<p class="mut" style="font-size:13px">装出口机首次要下 xray，可能要几分钟。关掉窗口、刷新页面都不会中断，再点「查看链接 / 出口命令」能接着看进度。</p>';
   $("resB").appendChild(d)}
 else if(j.ssh_error){const d=document.createElement("p");d.className="err";d.style.fontSize="13px";
   d.textContent="SSH 安装没能开始："+j.ssh_error;$("resB").appendChild(d)}
-$("dRes").showModal()}
-async function pollSsh(job){
-  for(let i=0;i<200;i++){
-    await new Promise(r=>setTimeout(r,i<3?2000:5000));
+$("dRes").showModal();
+if(j.ssh_job)pollSsh(j.ssh_job,!!j.ssh_done)}
+let sshPollGen=0;
+async function pollSsh(job,quiet){
+  const gen=++sshPollGen;let last=-1;
+  for(let i=0;i<400;i++){
+    await new Promise(r=>setTimeout(r,i<3?2000:3000));
+    if(gen!==sshPollGen)return;
     let j;
     try{j=await post("/api/ssh-status",{job})}catch(x){
       const s=$("sshState");if(s)s.textContent="读取进度失败："+x.message;return}
-    const s=$("sshState");
+    if(gen!==sshPollGen)return;
+    const s=$("sshState"),tm=$("sshTime"),bar=$("sshBar"),o=$("sshOut");
     if(s)s.textContent=j.state||"";
+    if(tm)tm.textContent=(j.elapsed!=null?j.elapsed+" 秒":"")+(j.pct!=null?" · "+j.pct+"%":"");
+    if(bar)bar.style.width=(j.pct||0)+"%";
+    if(o&&j.output){o.hidden=false;if(j.output!==last){last=j.output;o.textContent=j.output;o.scrollTop=o.scrollHeight}}
     if(j.done){
-      const o=$("sshOut");
-      if(o&&j.output){o.hidden=false;o.textContent=j.output}
-      if(j.rc===0){toast("出口机 "+j.node+" 已装好","ok")}
-      else{toast("出口机安装失败，请用上面的一键代码手动装","bad")}
-      load();return}
+      const sp=$("sshSpin");if(sp)sp.style.display="none";
+      if(!quiet){
+        if(j.rc===0){toast("出口机 "+j.node+" 已装好","ok")}
+        else{toast("出口机安装失败，请用上面的一键代码手动装","bad")}}
+      if(!quiet)load();
+      return}
   }
 }
 document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>b.closest("dialog").close());
@@ -3058,7 +3180,7 @@ try{const j=await post("/api/add",{name,port,sni,kind,ssh_host:sshHost,ssh_user:
   ssh_port:sshPort,ssh_pass:sshPass,ssh_key:sshKey});
 $("dAdd").close();toast("节点 "+name+" 已添加","ok");
 $("aSshPass").value="";$("aSshKey").value="";
-showRes(j,"新节点 "+name+" 已添加");if(j.ssh_job)pollSsh(j.ssh_job)}
+showRes(j,"新节点 "+name+" 已添加")}
 catch(x){fail("添加失败："+x.message,x.out)}finally{$("aGo").disabled=false;$("aGo").textContent="添加";load()}};
 $("bRef").onclick=load;
 $("bProbe").onclick=async e=>{const b=e.target;b.disabled=true;b.textContent="探测中…";try{await post("/api/probe",{});toast("探测完成","ok")}catch(x){toast(x.message,"bad")}b.disabled=false;b.textContent="立即探测";load()};
@@ -3218,12 +3340,20 @@ class H(http.server.BaseHTTPRequestHandler):
             if not j:
                 return self.jsend(404, {'error': '任务不存在或已过期'})
             return self.jsend(200, {'ok': True, 'node': j['node'], 'state': j['state'],
-                                    'rc': j['rc'], 'done': j['done'], 'output': j['log']})
+                                    'rc': j['rc'], 'done': j['done'], 'pct': j.get('pct', 0),
+                                    'target': j.get('target', ''),
+                                    'elapsed': max(0, (j.get('finished') or now()) - j.get('started', j['ts'])),
+                                    'output': '\n'.join(j.get('log') or [])})
         if r in ('/api/link', '/api/add', '/api/del') and not os.path.isfile(SCRIPT):
             return self.jsend(501, {'error': '面板未开启节点管理：请在 A 机重跑一次 --web'})
         if r == '/api/link':
             try:
-                return self.jsend(200, dict(node_link(n), ok=True))
+                res = dict(node_link(n), ok=True)
+                v = ssh_view(n)
+                if v:
+                    res.update({'ssh_job': v['job'], 'ssh_target': v['target'],
+                                'ssh_state': v['state'], 'ssh_done': v['done']})
+                return self.jsend(200, res)
             except Exception as e:
                 return self.jsend(500, {'error': '取链接失败', 'output': str(e)})
         if r == '/api/add':
@@ -3295,12 +3425,13 @@ class H(http.server.BaseHTTPRequestHandler):
         # 节点已建好。填了 SSH 就后台开装：装出口机要几分钟，
         # 这一步不能卡在请求里（经 hub 代理时代理只等 280s）。
         if sh and res.get('exit_cmd'):
-            jid = ssh_job_new(name)
+            target = '%s@%s:%s' % (su, sh, sp)
+            jid = ssh_job_new(name, target)
             args = (sh, int(sp), su, spw, skey, res['exit_cmd'])
             threading.Thread(target=ssh_job_run, args=(jid, name, args),
                              daemon=True).start()
             res['ssh_job'] = jid
-            res['ssh_target'] = '%s@%s:%s' % (su, sh, sp)
+            res['ssh_target'] = target
         elif sh:
             res['ssh_error'] = '取不到出口机命令，没法 SSH 安装，请用下面的命令手动装'
         return self.jsend(200, res)
