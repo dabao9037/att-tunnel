@@ -4030,6 +4030,7 @@ upgrade_program(){
     fi
     rm -f "$ag"
   fi
+  hub_quota_sync || true
   # 没有显式来源时保留面板原有的 WEB_RAW_URL，避免把固定提交降级回 main
   if [ "$RAW_EXPLICIT" = 1 ]; then save_web_raw_url; fi
   if [ -f "$WEB_ENV" ]; then
@@ -4041,6 +4042,64 @@ upgrade_program(){
       die "面板重启失败，升级未完成"; }
   fi
   ok "att-tunnel 已更新到 v$VERSION（节点配置未改动）"
+}
+
+
+# 转发机若装了 hub agent，顺带同步端口限额（面板升级路径也能自愈）
+hub_quota_sync(){
+  [ -f /etc/att-hub-agent/agent.env ] || return 0
+  local hub token ports wg qdir=/usr/local/lib/att-quota qetc=/etc/att-quota
+  hub=$(grep -E '^HUB_URL=' /etc/att-hub-agent/agent.env | cut -d= -f2-)
+  token=$(grep -E '^HUB_TOKEN=' /etc/att-hub-agent/agent.env | cut -d= -f2-)
+  [ -n "$hub" ] && [ -n "$token" ] || return 0
+  ports=$(python3 - <<'PY' 2>/dev/null || true
+import json
+d=json.load(open('/usr/local/etc/att-tunnel/config.json'))
+for i in d.get('inbounds',[]):
+    tag=str(i.get('tag',''))
+    if tag=='probe-in' or tag.startswith('probe'):
+        continue
+    p=i.get('port')
+    if isinstance(p,int) and p>0:
+        print('tcp:%d'%p)
+PY
+)
+  wg=$(python3 -c "import json;print(json.load(open('/etc/att-tunnel/wg.json')).get('port',''))" 2>/dev/null || true)
+  [ -n "$wg" ] && ports="$ports udp:$wg"
+  ports=$(echo $ports | tr ' ' '\n' | sort -u | tr '\n' ' ')
+  [ -n "$ports" ] || return 0
+  mkdir -p "$qdir" "$qetc"
+  curl -fsSL "https://raw.githubusercontent.com/dabao9037/att-tunnel-hub/main/quota2.py?ts=$(date +%s)" -o "$qdir/quota.py" || return 0
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$qdir/quota.py" || return 0
+  chmod 700 "$qdir/quota.py"
+  umask 077
+  printf 'HUB_URL=%s\nHUB_TOKEN=%s\nPORTS=%s\nTHRESHOLD=50G\n' "$hub" "$token" "$ports" > "$qetc/quota.env"
+  chmod 600 "$qetc/quota.env"
+  umask 022
+  cat > /etc/systemd/system/att-quota.service <<EOF
+[Unit]
+Description=att-tunnel port daily quota
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 $qdir/quota.py
+EOF
+  cat > /etc/systemd/system/att-quota.timer <<EOF
+[Unit]
+Description=run att-tunnel quota every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now att-quota.timer >/dev/null 2>&1 || true
+  /usr/bin/python3 "$qdir/quota.py" || true
+  ok "端口限额已同步"
 }
 
 web_disable(){
