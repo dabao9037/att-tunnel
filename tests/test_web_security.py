@@ -32,7 +32,7 @@ order = [post.index('self.session()'), post.index('self.same_origin()'),
 assert order == sorted(order), '升级入口必须在会话、同源、CSRF 校验之后: %r' % order
 assert 'def same_origin' in web_src
 assert 'raw = RAW_URL or aenv.get' in web_src, '面板升级必须能回退到 WEB_RAW_URL'
-assert 'ATT_RAW_URL=%s bash -s -- --upgrade' in web_src, '升级子进程必须继承当前来源 URL'
+assert 'ATT_RAW_URL=%s bash -s -- --upgrade' in web_src and '?ts=%d' in web_src, '升级子进程必须继承当前来源 URL'
 print('PASS: static order session -> same-origin -> CSRF -> /__upgrade__')
 
 # --upgrade 只能刷新程序，不能重写节点配置（防止再次出现 11-13 的节点绑定被抹）

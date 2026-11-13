@@ -3840,8 +3840,8 @@ class H(http.server.BaseHTTPRequestHandler):
         # 后台执行升级（下载 + bash script.sh --upgrade），不卡住这个请求
         def upgrade_task():
             try:
-                cmd = ('curl -fsSL %s | ATT_RAW_URL=%s bash -s -- --upgrade'
-                       % (shlex.quote(raw), shlex.quote(raw)))
+                cmd = ('curl -fsSL "%s?ts=%d" | ATT_RAW_URL=%s bash -s -- --upgrade'
+                       % (shlex.quote(raw), int(time.time()), shlex.quote(raw)))
                 log('执行升级命令：%s' % cmd)
                 subprocess.run(cmd, shell=True, timeout=300,
                               env=dict(os.environ, ATT_YES='1'),
@@ -3993,7 +3993,7 @@ upgrade_program(){
   # 本机装过 att-hub-agent 时顺带刷新它：hub 侧的端口限额与自更新靠这条引导
   if [ -f /usr/local/lib/att-hub-agent/agent.py ]; then
     local ag; ag=$(mktemp)
-    if curl -fsSL "${ATT_HUB_AGENT_RAW:-https://raw.githubusercontent.com/dabao9037/att-tunnel-hub/main/agent.py}" -o "$ag" \
+    if curl -fsSL "${ATT_HUB_AGENT_RAW:-https://raw.githubusercontent.com/dabao9037/att-tunnel-hub/main/agent.py}?ts=$(date +%s)" -o "$ag" \
        && python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$ag"; then
       install -m 700 -o root -g root "$ag" /usr/local/lib/att-hub-agent/agent.py
       systemctl restart att-hub-agent || warn "att-hub-agent 重启失败"
