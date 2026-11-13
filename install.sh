@@ -3840,7 +3840,8 @@ class H(http.server.BaseHTTPRequestHandler):
         # 后台执行升级（下载 + bash script.sh --upgrade），不卡住这个请求
         def upgrade_task():
             try:
-                cmd = 'curl -fsSL %s | bash -s -- --upgrade' % shlex.quote(raw)
+                cmd = ('curl -fsSL %s | ATT_RAW_URL=%s bash -s -- --upgrade'
+                       % (shlex.quote(raw), shlex.quote(raw)))
                 log('执行升级命令：%s' % cmd)
                 subprocess.run(cmd, shell=True, timeout=300,
                               env=dict(os.environ, ATT_YES='1'),
@@ -3989,7 +3990,8 @@ upgrade_program(){
   tune_only || warn "TCP 调优（BBR）没成功，不影响使用"
   svcb_enable || true
   install_script_copy || true
-  save_web_raw_url
+  # 没有显式来源时保留面板原有的 WEB_RAW_URL，避免把固定提交降级回 main
+  if [ "$RAW_EXPLICIT" = 1 ]; then save_web_raw_url; fi
   if [ -f "$WEB_ENV" ]; then
     write_web_py
     systemctl restart "$WEB_SVC"
@@ -4270,6 +4272,7 @@ menu(){
 
 # 生成给 B 的命令用哪个脚本地址；测试分支/指定提交时用 ATT_RAW_URL 覆盖
 RAW_URL="${ATT_RAW_URL:-https://raw.githubusercontent.com/dabao9037/att-tunnel/main/install.sh}"
+RAW_EXPLICIT="${ATT_RAW_URL:+1}"
 
 case "${1:-}" in
   --bridge)   need_root; deploy_b "${2:-}"; svcb_enable ;;

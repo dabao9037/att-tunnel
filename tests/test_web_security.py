@@ -32,6 +32,7 @@ order = [post.index('self.session()'), post.index('self.same_origin()'),
 assert order == sorted(order), '升级入口必须在会话、同源、CSRF 校验之后: %r' % order
 assert 'def same_origin' in web_src
 assert 'raw = RAW_URL or aenv.get' in web_src, '面板升级必须能回退到 WEB_RAW_URL'
+assert 'ATT_RAW_URL=%s bash -s -- --upgrade' in web_src, '升级子进程必须继承当前来源 URL'
 print('PASS: static order session -> same-origin -> CSRF -> /__upgrade__')
 
 # --upgrade 只能刷新程序，不能重写节点配置（防止再次出现 11-13 的节点绑定被抹）
@@ -39,8 +40,10 @@ assert re.search(r'^\s*--upgrade\)\s+upgrade_program', src, re.M), '缺少 --upg
 up = src[src.index('upgrade_program(){'):src.index('web_disable(){')]
 for forbidden in ('apply_cfg', 'deploy_a', 'deploy_b', '--server-a', '--migrate'):
     assert forbidden not in up, '--upgrade 不应调用 %s' % forbidden
-for needed in ('write_web_py', 'install_script_copy', 'systemctl restart'):
-    assert needed in up, '--upgrade 缺少 %s' % needed
+for needed in ('write_web_py', 'install_script_copy', 'systemctl restart',
+               'RAW_EXPLICIT', 'ATT_RAW_URL'):
+    assert needed in up or needed in src, '--upgrade 缺少 %s' % needed
+assert '[ "$RAW_EXPLICIT" = 1 ] && save_web_raw_url' not in src, '来源覆盖必须用 if，避免 set -e 陷阱'
 print('PASS: --upgrade refreshes program/panel only, never rewrites node config')
 
 with tempfile.TemporaryDirectory() as tmp:
