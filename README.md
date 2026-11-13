@@ -61,8 +61,8 @@ account ... is rejected since the client flow is empty
 
 默认配置是 **VLESS + REALITY + XTLS Vision over TCP**，这是 REALITY 设计时的主用场景，也是目前社区最主流的抗封组合：
 
-- **REALITY**：没有自签证书、不需域名。对外展示的是真实站点（默认 `www.atlasobscura.com`）的**真证书**；被主动探测时流量直接回落到该真站，探测者看不出异常。
-  实测：从外部 `openssl s_client` 直连 A:443，得到 `subject=CN = atlasobscura.com`、`issuer=Google Trust Services`、`Verify return code: 0 (ok)`。
+- **REALITY**：没有自签证书、不需域名。对外展示的是真实站点（默认 `www.debian.org`）的**真证书**；被主动探测时流量直接回落到该真站，探测者看不出异常。
+  实测：从外部 `openssl s_client` 直连 A:443，得到 `subject=CN = www.debian.org`、`issuer=Let's Encrypt (YR1)`、`Verify return code: 0 (ok)`。
 - **XTLS Vision**（`flow=xtls-rprx-vision`）：消除 TLS-in-TLS 指纹。没有它的话，TCP+REALITY 的内层 TLS 握手会在外层 TLS 里形成可识别特征。这是抗封的关键项。
 - **端口建议用 443**。非 443 的 TLS 流量本身就显眼，Xray 自己也会对此告警。
 
@@ -98,7 +98,7 @@ ATT_XRAY_VER=v26.6.22 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9
 
 **已装过 Xray？** 脚本会直接复用（不重装），并自动探测版本是否支持 Reverse + XHTTP；不支持才询问你是否升级。除 `/usr/local/bin/xray` 外，也会自动在 `/usr/bin`、3x-ui、宝塔等常见路径查找。
 
-**伪装域名（SNI）** 默认用 `www.atlasobscura.com`，与 NodeLite 保持一致。预置列表也和 NodeLite 同步，部署时会自动挑选当下真实可用的一个。想指定其他域名：
+**伪装域名（SNI）** 默认用 `www.debian.org`，与 NodeLite 保持一致。预置列表也和 NodeLite 同步，部署时会自动挑选当下真实可用的一个。想指定其他域名：
 
 ```bash
 ATT_SNI=www.gog.com bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/att-tunnel/main/install.sh) --server-a

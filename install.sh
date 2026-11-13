@@ -159,8 +159,8 @@ install_xray(){
 # 证书匹配；部署时仍会逐个实测，不通的自动跳过。
 # 伪装域名列表：域名 | 国家/地区
 CANDIDATES_WITH_COUNTRY=(
-  "www.atlasobscura.com|美国"
-  "www.backblaze.com|美国"
+  "www.debian.org|美国"
+  "www.postgresql.org|美国"
   "www.skao.int|英国"
   "www.sciencemuseum.org.uk|英国"
   "www.4gamer.net|日本"
@@ -285,10 +285,36 @@ EOF
   systemctl daemon-reload
 }
 
+# 访问日志：目录 + 轮转。copytruncate 避免轮转时重启 xray 断连接。
+# 注意：Xray 的 access 日志只记录进入代理层的连接；REALITY 回落/握手失败的
+# 探测不会写进 access 日志，那部分靠 realitySettings.show 输出的 remoteAddr。
+ACCESS_LOG="/var/log/att-tunnel/access.log"
+ensure_access_log(){
+  local dir; dir=$(dirname "$ACCESS_LOG")
+  mkdir -p "$dir"
+  chmod 750 "$dir" 2>/dev/null || true
+  [ -f /etc/logrotate.d/att-tunnel ] && return 0
+  mkdir -p /etc/logrotate.d
+  cat > /etc/logrotate.d/att-tunnel <<'LOGROTATE'
+/var/log/att-tunnel/*.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
+LOGROTATE
+  chmod 644 /etc/logrotate.d/att-tunnel
+}
+
 # 原子写入 + 配置校验，失败自动还原
 apply_cfg(){
   local new="$1"
   mkdir -p "$CFG_DIR"
+  ensure_access_log
   if [ -f "$CFG" ]; then
     cp "$CFG" "$CFG.bak-$(date +%Y%m%d%H%M%S)"
   fi
@@ -1200,7 +1226,7 @@ deploy_a(){
   local tmp; tmp=$(mktemp --suffix=.json)
   cat > "$tmp" <<EOF
 {
-  "log": { "loglevel": "warning" },
+  "log": { "loglevel": "warning", "access": "/var/log/att-tunnel/access.log" },
 $a_reverse_blk
   "inbounds": [
     {
@@ -1216,6 +1242,7 @@ $a_reverse_blk
         $a_net
         "security": "reality",
         "realitySettings": {
+          "show": true,
           "target": "$sni:443",
           "serverNames": [ "$sni" ],
           "privateKey": "$priv",
