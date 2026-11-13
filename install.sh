@@ -4069,7 +4069,7 @@ PY
   ports=$(echo $ports | tr ' ' '\n' | sort -u | tr '\n' ' ')
   [ -n "$ports" ] || return 0
   mkdir -p "$qdir" "$qetc"
-  curl -fsSL "https://raw.githubusercontent.com/dabao9037/att-tunnel-hub/main/quota2.py?ts=$(date +%s)" -o "$qdir/quota.py" || return 0
+  curl -fsSL "https://raw.githubusercontent.com/dabao9037/att-tunnel-hub/main/quota3.py?ts=$(date +%s)" -o "$qdir/quota.py" || return 0
   python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$qdir/quota.py" || return 0
   chmod 700 "$qdir/quota.py"
   umask 077
