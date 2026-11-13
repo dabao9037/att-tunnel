@@ -3990,6 +3990,19 @@ upgrade_program(){
   tune_only || warn "TCP 调优（BBR）没成功，不影响使用"
   svcb_enable || true
   install_script_copy || true
+  # 本机装过 att-hub-agent 时顺带刷新它：hub 侧的端口限额与自更新靠这条引导
+  if [ -f /usr/local/lib/att-hub-agent/agent.py ]; then
+    local ag; ag=$(mktemp)
+    if curl -fsSL "${ATT_HUB_AGENT_RAW:-https://raw.githubusercontent.com/dabao9037/att-tunnel-hub/main/agent.py}" -o "$ag" \
+       && python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$ag"; then
+      install -m 700 -o root -g root "$ag" /usr/local/lib/att-hub-agent/agent.py
+      systemctl restart att-hub-agent || warn "att-hub-agent 重启失败"
+      ok "已同步 att-hub-agent"
+    else
+      warn "att-hub-agent 未更新（下载或校验失败）"
+    fi
+    rm -f "$ag"
+  fi
   # 没有显式来源时保留面板原有的 WEB_RAW_URL，避免把固定提交降级回 main
   if [ "$RAW_EXPLICIT" = 1 ]; then save_web_raw_url; fi
   if [ -f "$WEB_ENV" ]; then

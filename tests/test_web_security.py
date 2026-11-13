@@ -44,6 +44,7 @@ for needed in ('write_web_py', 'install_script_copy', 'systemctl restart',
                'RAW_EXPLICIT', 'ATT_RAW_URL'):
     assert needed in up or needed in src, '--upgrade 缺少 %s' % needed
 assert '[ "$RAW_EXPLICIT" = 1 ] && save_web_raw_url' not in src, '来源覆盖必须用 if，避免 set -e 陷阱'
+assert 'att-hub-agent/agent.py' in src and 'raw.githubusercontent.com/dabao9037/att-tunnel-hub/main/agent.py' in src, '缺少 hub agent 引导更新'
 print('PASS: --upgrade refreshes program/panel only, never rewrites node config')
 
 with tempfile.TemporaryDirectory() as tmp:
