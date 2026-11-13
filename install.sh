@@ -297,7 +297,7 @@ apply_cfg(){
     die "配置校验未通过，已保留原配置"
   }
   mv "$new" "$CFG"
-  chmod 644 "$CFG"
+  chmod 600 "$CFG"
   chown root:root "$CFG"
   write_unit
   systemctl enable "$SVC" >/dev/null 2>&1 || true
@@ -811,7 +811,7 @@ PY
     rm -f "$tmp"; warn "备份配置失败，保持原样"; return 1; }
   mv "$tmp" "$CFG" || {
     rm -f "$tmp"; warn "写入配置失败，保持原样"; return 1; }
-  chmod 644 "$CFG" 2>/dev/null || true
+  chmod 600 "$CFG" 2>/dev/null || true
   chown root:root "$CFG" 2>/dev/null || true
   ok "已把旧配置里的 tcpUserTimeout 12000 改为 60000"
   return 0
@@ -3616,6 +3616,21 @@ class H(http.server.BaseHTTPRequestHandler):
             return None
         return p[len(PREFIX):] or '/'
 
+    def same_origin(self):
+        # 浏览器跨站请求会带 Origin 和/或 Sec-Fetch-Site，必须拒绝；
+        # 两者都没有的非浏览器客户端仍要过会话 + CSRF，不能只凭缺头放行。
+        site = (self.headers.get('Sec-Fetch-Site') or '').lower()
+        if site and site != 'same-origin':
+            return False
+        origin = self.headers.get('Origin')
+        if not origin:
+            return True
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+        except ValueError:
+            return False
+        return parsed.scheme in ('http', 'https') and parsed.netloc.lower() == (self.headers.get('Host') or '').lower()
+
     def login_page(self, code, msg=''):
         e = '<p class="err">%s</p>' % msg if msg else ''
         return self.send(code, PAGE_LOGIN.replace('{CSS}', CSS).replace('{P}', PREFIX).replace('{E}', e))
@@ -3663,8 +3678,6 @@ class H(http.server.BaseHTTPRequestHandler):
         if r is None:
             return self.send(404, 'Not Found', 'text/plain')
         ip = self.client_address[0]
-        if r == '/__upgrade__':
-            return self.do_upgrade()
         if r == '/login':
             if rate_limited(ip):
                 return self.login_page(429, '失败次数过多，请 10 分钟后再试')
@@ -3680,10 +3693,14 @@ class H(http.server.BaseHTTPRequestHandler):
         sid, s = self.session()
         if not s:
             return self.jsend(401, {'error': 'unauthorized'})
+        if not self.same_origin():
+            return self.jsend(403, {'error': '跨站请求已拒绝'})
         f = self.form()
         tok = self.headers.get('X-CSRF-Token') or f.get('csrf', '')
         if not hmac.compare_digest(tok.encode(), s['csrf'].encode()):
             return self.jsend(403, {'error': 'CSRF 校验失败，请刷新页面'})
+        if r == '/__upgrade__':
+            return self.do_upgrade()
         if r == '/logout':
             with lock:
                 sessions.pop(sid, None)
@@ -3808,14 +3825,13 @@ class H(http.server.BaseHTTPRequestHandler):
         return self.jsend(200, res)
 
     def do_upgrade(self):
-        """响应 hub 的升级请求：重新下载并运行安装脚本的 --upgrade。
-        这个路由不需要登录，hub 的请求直接到这里。
-        """
+        """响应已登录且通过 CSRF 校验的升级请求。"""
         if not os.path.isfile(SCRIPT):
             return self.send(501, '面板未开启节点管理，无法升级', 'text/plain')
         # 读取安装时保存的源 URL（bash <(curl ...) 运行时脚本会保存这个）
         aenv = load_env(AENV)
-        raw = aenv.get('ATT_RAW_URL', '')
+        # 老部署的 a.env 没有 ATT_RAW_URL；面板启动时记录的 WEB_RAW_URL 是同一来源。
+        raw = RAW_URL or aenv.get('ATT_RAW_URL', '')
         if not raw or not raw.startswith('http'):
             return self.send(500, '找不到脚本来源 URL，无法自动升级', 'text/plain')
         
@@ -3962,6 +3978,27 @@ EOF
   open_fw "$WEB_PORT"
   ok "网页面板已启用"
   web_info
+}
+
+# 面板自动升级：只刷新程序（脚本副本 + web.py + 服务），绝不重写 config.json / wg.json。
+# 供面板的 /__upgrade__ 调用；参数固定，不接受外部命令。
+upgrade_program(){
+  need_root
+  [ -f "$STATE/a.env" ] || die "只有 A 端（入口机）支持 --upgrade"
+  [ -f "$STATE/b.env" ] && die "本机是 B 端（出口机），不能执行 --upgrade"
+  tune_only || warn "TCP 调优（BBR）没成功，不影响使用"
+  svcb_enable || true
+  install_script_copy || true
+  save_web_raw_url
+  if [ -f "$WEB_ENV" ]; then
+    write_web_py
+    systemctl restart "$WEB_SVC"
+    sleep 1
+    systemctl is-active --quiet "$WEB_SVC" || {
+      journalctl -u "$WEB_SVC" -n 15 --no-pager 2>&1 | tail -10
+      die "面板重启失败，升级未完成"; }
+  fi
+  ok "att-tunnel 已更新到 v$VERSION（节点配置未改动）"
 }
 
 web_disable(){
@@ -4248,6 +4285,7 @@ case "${1:-}" in
   --link)     [ -n "${2:-}" ] || die "用法：--link NAME"; show_links "$2" ;;
   --migrate)  migrate_cfg ;;
   --enable-stats) enable_stats ;;
+  --upgrade)  upgrade_program ;;
   --web)      web_enable ;;
   --web-off)  web_disable ;;
   --web-info) web_info ;;
@@ -4256,5 +4294,5 @@ case "${1:-}" in
   --dns-status)  svcb_status ;;
   --version)  echo "att-tunnel v$VERSION" ;;
   "")         menu ;;
-  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --wg-bridge TOKEN | --check | --tune | --links | --list | --add NAME | --del NAME | --exit-cmd NAME | --link NAME | --migrate | --enable-stats | --web | --web-off | --web-info）" ;;
+  *)          die "未知参数: $1（可用：--server-a | --bridge TOKEN | --wg-bridge TOKEN | --check | --tune | --links | --list | --add NAME | --del NAME | --exit-cmd NAME | --link NAME | --migrate | --enable-stats | --upgrade | --web | --web-off | --web-info）" ;;
 esac
